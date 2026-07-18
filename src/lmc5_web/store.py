@@ -777,7 +777,7 @@ class MemoryStore:
                 FROM lmc5_curated_memories m
                 LEFT JOIN lmc5_source_documents d ON d.id=m.source_document_id
                 WHERE m.version_status='current'
-                GROUP BY source_type ORDER BY count DESC,source_type
+                GROUP BY 1 ORDER BY 2 DESC,1
                 """
             ).fetchall()
             privacy = conn.execute(

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LMC-5 Living Memory</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0d1010;--panel:#171b1a;--line:#303836;--text:#f2f3ee;--muted:#aeb7b3;--accent:#b7e3cf;--warm:#ead5ac;--danger:#ffaaa0}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 18% 0,#18352d 0,transparent 35%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,"PingFang SC",sans-serif;line-height:1.65}
+    main{width:min(920px,calc(100% - 28px));margin:34px auto 70px}.hero,.card{background:#171b1aee;border:1px solid var(--line);border-radius:24px;box-shadow:0 24px 70px #0006}.hero{padding:30px}.card{padding:24px;margin-top:18px}h1{margin:8px 0;font-size:clamp(30px,6vw,52px);line-height:1.05}h2{margin:0 0 8px;font-size:21px}.eyebrow{color:var(--accent);font-weight:750;letter-spacing:.08em;text-transform:uppercase;font-size:12px}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}@media(max-width:720px){.grid{grid-template-columns:1fr}}
+    label{display:block;color:var(--muted);font-size:13px;margin:16px 0 7px}input,select,button{width:100%;border-radius:13px;padding:13px 14px;font:inherit}input,select{background:#0e1211;color:var(--text);border:1px solid var(--line)}button{border:0;background:var(--accent);color:#10251e;font-weight:850;cursor:pointer;margin-top:16px}button.secondary{background:var(--warm);color:#2a2112}button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:10px;align-items:center}.row input[type=checkbox]{width:auto}.row label{margin:0;color:var(--text)}pre{white-space:pre-wrap;word-break:break-word;background:#0b0e0d;border:1px solid var(--line);border-radius:16px;padding:16px;max-height:420px;overflow:auto;color:#d7e7df}.status{display:inline-flex;align-items:center;gap:8px;color:var(--muted)}.dot{width:9px;height:9px;border-radius:50%;background:var(--warm)}.dot.ok{background:#70d7a8}.dot.bad{background:var(--danger)}code{color:var(--accent)}
+  </style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <div class="eyebrow">Living Memory Coordinate-5</div>
+    <h1>让记忆留下来，也让它呼吸。</h1>
+    <p class="muted">Claude 网页版的私人长期记忆层。原始档案保留证据，精选记忆负责影响未来，敏感内容不会参加随机浮现。</p>
+    <div class="status"><span id="dot" class="dot"></span><span id="health">正在检查服务…</span></div>
+  </section>
+
+  <section class="grid">
+    <form class="card" id="ombre-form">
+      <h2>导入 Ombre Brain</h2>
+      <p class="muted">接受原始 zip；会自动忽略 <code>.env</code> 与认证文件。</p>
+      <label>访问密码</label><input class="token" type="password" autocomplete="current-password" required>
+      <label>ombre-brain.zip</label><input name="archive" type="file" accept=".zip,application/zip" required>
+      <div class="row"><input name="apply" type="checkbox" id="ombre-apply"><label for="ombre-apply">确认写入数据库（不勾选只预览）</label></div>
+      <button type="submit">检查 / 导入 OB</button>
+    </form>
+
+    <form class="card" id="ltm-form">
+      <h2>导入 LTM 归档</h2>
+      <p class="muted">基础档案与日更补丁会拆成来源文档和可召回记忆。</p>
+      <label>访问密码</label><input class="token" type="password" autocomplete="current-password" required>
+      <label>归档.zip</label><input name="archive" type="file" accept=".zip,application/zip" required>
+      <div class="row"><input name="apply" type="checkbox" id="ltm-apply"><label for="ltm-apply">确认写入数据库（不勾选只预览）</label></div>
+      <button class="secondary" type="submit">检查 / 导入 LTM</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>结果</h2>
+    <p class="muted">建议先不勾选写入，确认数量与隐私分层后再正式导入。重复上传是幂等的，不会重复造记忆。</p>
+    <pre id="result">等待文件。</pre>
+  </section>
+</main>
+<script>
+const result=document.querySelector('#result');
+async function checkHealth(){
+  const dot=document.querySelector('#dot'), text=document.querySelector('#health');
+  try{const r=await fetch('/healthz');dot.className='dot '+(r.ok?'ok':'bad');text.textContent=r.ok?'数据库已连接':'数据库尚未就绪';}
+  catch(e){dot.className='dot bad';text.textContent='服务不可达';}
+}
+async function submit(event,kind){
+  event.preventDefault();const form=event.currentTarget,button=form.querySelector('button');button.disabled=true;result.textContent='正在安全检查压缩包…';
+  try{const data=new FormData();data.append('archive',form.elements.archive.files[0]);data.append('apply',form.elements.apply.checked?'true':'false');
+    const token=form.querySelector('.token').value;const r=await fetch(`/api/import/${kind}`,{method:'POST',headers:{'X-API-Key':token},body:data});const j=await r.json();result.textContent=JSON.stringify(j,null,2);if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);await checkHealth();
+  }catch(e){result.textContent=`导入失败：${e.message}\n\n`+result.textContent;}finally{button.disabled=false;}
+}
+document.querySelector('#ombre-form').addEventListener('submit',e=>submit(e,'ombre'));
+document.querySelector('#ltm-form').addEventListener('submit',e=>submit(e,'ltm'));
+checkHealth();
+</script>
+</body>
+</html>

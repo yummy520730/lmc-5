@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lmc5-claude-web"
+version = "0.2.0"
+description = "A private LMC-5 PostgreSQL memory service for Claude Web remote MCP."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "LMC-5 contributors" }
+]
+keywords = ["ai-memory", "long-term-memory", "postgresql", "pgvector", "remote-mcp", "claude-web"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "mcp==1.28.1",
+  "psycopg[binary]>=3.2,<4",
+  "python-multipart>=0.0.20,<1",
+  "PyYAML>=6.0.2,<7",
+  "starlette>=0.47,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.1,<2",
+]
+
+[project.scripts]
+lmc5 = "lmc5.cli:main"
+lmc5-web = "lmc5_web.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lmc5_web = ["schema.sql", "static/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "tests_web"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

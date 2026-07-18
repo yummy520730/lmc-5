@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import random
+import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from importlib.resources import files
 from typing import Any, Iterator, Sequence
 
@@ -36,6 +38,36 @@ ALLOWED_CATEGORIES = {
 }
 ALLOWED_PRIVACY = {"personal", "sensitive", "secret", "public"}
 ALLOWED_ROLES = {"user", "assistant", "system", "tool", "note"}
+
+QUERY_TERM_SYNONYMS = {
+    "裁员": ("被裁", "辞退", "解雇", "优化", "n+1", "赔偿"),
+    "工作": ("职业", "上班", "任职", "公司", "岗位", "合同", "续签", "工资"),
+    "离婚": ("婚姻", "离婚协议", "起诉离婚", "抚养权", "律师"),
+    "回家": ("回老家", "搬家", "返乡"),
+}
+
+
+def _query_concepts(query: str) -> list[tuple[str, ...]]:
+    raw_terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.+\-]*|[\u4e00-\u9fff]{2,}", query)
+    if not raw_terms:
+        raw_terms = [query]
+    concepts: list[tuple[str, ...]] = []
+    for raw in raw_terms[:12]:
+        alternatives = [raw]
+        for key, synonyms in QUERY_TERM_SYNONYMS.items():
+            if key in raw or raw in key:
+                alternatives.extend((key, *synonyms))
+        concepts.append(tuple(dict.fromkeys(item.casefold() for item in alternatives if item)))
+    return concepts
+
+
+def _query_coverage(memory: dict[str, Any], concepts: list[tuple[str, ...]]) -> float:
+    if not concepts:
+        return 0.0
+    tags = " ".join(str(tag) for tag in memory.get("tags") or [])
+    text = f"{memory.get('title') or ''}\n{memory.get('content') or ''}\n{tags}".casefold()
+    matched = sum(any(term in text for term in alternatives) for alternatives in concepts)
+    return matched / len(concepts)
 
 
 class StoreUnavailable(RuntimeError):
@@ -116,7 +148,7 @@ class MemoryStore:
                       title=%s,content=%s,thread=%s,tags=%s,metadata=%s,weight=%s,
                       original_importance=%s,valence=%s,arousal=%s,
                       protected=(protected OR %s),privacy_scope=%s,surface_allowed=%s,
-                      resolved=(resolved OR %s),digested=(digested OR %s),
+                      resolved=(resolved OR %s),digested=(digested OR %s),version_status='current',
                       created_at=COALESCE(%s,created_at),updated_at=NOW()
                     WHERE id=%s
                     """,
@@ -233,23 +265,30 @@ class MemoryStore:
         if not query:
             return []
         privacy = ["personal", "public", "sensitive"] if include_sensitive else ["personal", "public"]
+        concepts = _query_concepts(query)
+        expanded_terms = list(dict.fromkeys(term for group in concepts for term in group))
+        patterns = [f"%{term}%" for term in expanded_terms]
         lexical_candidate_limit = max(limit * 6, 40)
         recent_candidate_limit = max(limit * 4, 24)
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 WITH eligible AS (
-                  SELECT *, similarity(COALESCE(title,'') || ' ' || content, %s) AS lexical_score
+                  SELECT *, similarity(COALESCE(title,'') || ' ' || content, %s) AS lexical_score,
+                    (SELECT count(*) FROM unnest(%s::text[]) AS term
+                     WHERE (COALESCE(title,'') || ' ' || content) ILIKE '%%' || term || '%%'
+                        OR array_to_string(tags,' ') ILIKE '%%' || term || '%%') AS term_hits
                   FROM lmc5_curated_memories
                   WHERE version_status='current'
                     AND privacy_scope = ANY(%s)
                     AND (
-                      (COALESCE(title,'') || ' ' || content) ILIKE '%%' || %s || '%%'
+                      (COALESCE(title,'') || ' ' || content) ILIKE ANY(%s)
+                      OR array_to_string(tags,' ') ILIKE ANY(%s)
                       OR similarity(COALESCE(title,'') || ' ' || content, %s) > 0.04
                     )
                 ), candidates AS (
                   (SELECT * FROM eligible
-                   ORDER BY lexical_score DESC, protected DESC, created_at DESC
+                   ORDER BY term_hits DESC, lexical_score DESC, protected DESC, created_at DESC
                    LIMIT %s)
                   UNION ALL
                   (SELECT * FROM eligible
@@ -261,8 +300,10 @@ class MemoryStore:
                 """,
                 (
                     query,
+                    expanded_terms,
                     privacy,
-                    query,
+                    patterns,
+                    patterns,
                     query,
                     lexical_candidate_limit,
                     recent_candidate_limit,
@@ -273,12 +314,17 @@ class MemoryStore:
             for row in rows:
                 item = dict(row)
                 live = vitality(item)
-                lexical = max(0.0, float(item.pop("lexical_score") or 0))
+                lexical = max(
+                    0.0,
+                    float(item.pop("lexical_score") or 0),
+                    _query_coverage(item, concepts),
+                )
+                item.pop("term_hits", None)
                 final, breakdown = recall_score(item, lexical)
                 item["score"] = final
                 item["score_breakdown"] = breakdown
                 item["vitality"] = live
-                item["channels"] = ["lexical", "vitality", "recency"]
+                item["channels"] = ["lexical", "entity_terms", "vitality", "recency"]
                 scored.append((final, item))
             scored.sort(key=lambda pair: pair[0], reverse=True)
             ranked = [item for _, item in scored]
@@ -502,8 +548,10 @@ class MemoryStore:
         documents: Sequence[dict[str, Any]],
         memories: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
-        created = reused = 0
+        created = reused = archived = same_document_relations = 0
         document_ids: dict[str, int] = {}
+        memory_ids_by_document: dict[int, list[int]] = {}
+        legacy_ids_by_document: dict[int, list[str]] = {}
         with self.connect() as conn:
             for document in documents:
                 row = conn.execute(
@@ -530,9 +578,54 @@ class MemoryStore:
                 data = dict(memory)
                 if key := data.pop("document_key", None):
                     data["source_document_id"] = document_ids.get(key)
-                _, is_new = self._upsert_memory(conn, data)
+                memory_id, is_new = self._upsert_memory(conn, data)
+                document_id = data.get("source_document_id")
+                if document_id:
+                    memory_ids_by_document.setdefault(int(document_id), []).append(memory_id)
+                    if data.get("legacy_id"):
+                        legacy_ids_by_document.setdefault(int(document_id), []).append(
+                            str(data["legacy_id"])
+                        )
                 created += int(is_new)
                 reused += int(not is_new)
+
+            if source_type == "ltm":
+                # Parser upgrades can merge several old bullet-sized records into
+                # one semantic section. Archive stale units from the same source
+                # document so re-importing fixes an existing database in place.
+                for document_id, legacy_ids in legacy_ids_by_document.items():
+                    result = conn.execute(
+                        """
+                        UPDATE lmc5_curated_memories
+                        SET version_status='archived',updated_at=NOW()
+                        WHERE source_document_id=%s AND legacy_source='ltm'
+                          AND version_status='current' AND legacy_id <> ALL(%s)
+                        """,
+                        (document_id, legacy_ids),
+                    )
+                    archived += max(0, int(result.rowcount or 0))
+
+                # Sections from one Day patch share a decision/time context even
+                # when classifiers place them in legal, worklog, and episode.
+                for document_id, memory_ids in memory_ids_by_document.items():
+                    unique_ids = sorted(set(memory_ids))
+                    for index, source_id in enumerate(unique_ids):
+                        for target_id in unique_ids[index + 1 :]:
+                            inserted = conn.execute(
+                                """
+                                INSERT INTO lmc5_memory_relations(
+                                  source_id,target_id,relation_type,strength,reason,status
+                                ) VALUES (%s,%s,'same_ltm_patch',0.72,%s,'current')
+                                ON CONFLICT (source_id,target_id,relation_type) DO NOTHING
+                                RETURNING id
+                                """,
+                                (
+                                    source_id,
+                                    target_id,
+                                    f"same imported LTM document {document_id}",
+                                ),
+                            ).fetchone()
+                            same_document_relations += int(bool(inserted))
             conn.execute(
                 """
                 INSERT INTO lmc5_import_runs(
@@ -546,10 +639,23 @@ class MemoryStore:
                     len(memories),
                     created,
                     reused,
-                    Jsonb({"document_ids": list(document_ids.values())}),
+                    Jsonb(
+                        {
+                            "document_ids": list(document_ids.values()),
+                            "archived_stale_memories": archived,
+                            "same_document_relations_created": same_document_relations,
+                        }
+                    ),
                 ),
             )
-        return {"documents": len(documents), "memories": len(memories), "created": created, "reused": reused}
+        return {
+            "documents": len(documents),
+            "memories": len(memories),
+            "created": created,
+            "reused": reused,
+            "archived_stale_memories": archived,
+            "same_document_relations_created": same_document_relations,
+        }
 
     def build_cross_source_relations(self, auto_threshold: float, review_threshold: float) -> dict[str, int]:
         with self.connect() as conn:
@@ -612,6 +718,228 @@ class MemoryStore:
                 "SELECT category,count(*) AS count FROM lmc5_curated_memories GROUP BY category ORDER BY count DESC"
             ).fetchall()
         return {**dict(row), "categories": [dict(item) for item in categories]}
+
+    @staticmethod
+    def _dashboard_source_sql() -> str:
+        return """
+            COALESCE(
+              d.source_type,
+              CASE
+                WHEN m.legacy_source='ombre_brain' THEN 'ombre_brain'
+                WHEN m.legacy_source='ltm' THEN 'ltm'
+                ELSE 'manual'
+              END
+            )
+        """
+
+    @staticmethod
+    def _dashboard_json_value(value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
+
+    @classmethod
+    def _dashboard_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        return {key: cls._dashboard_json_value(value) for key, value in dict(row).items()}
+
+    def dashboard_stats(self) -> dict[str, Any]:
+        """Return owner-only counts used by the small-home memory dashboard."""
+        source_sql = self._dashboard_source_sql()
+        with self.connect() as conn:
+            totals = conn.execute(
+                """
+                SELECT
+                  count(*) FILTER (WHERE version_status='current') AS memories,
+                  count(*) FILTER (
+                    WHERE version_status='current' AND privacy_scope IN ('sensitive','secret')
+                  ) AS sensitive,
+                  count(*) FILTER (WHERE version_status='current' AND protected) AS protected,
+                  count(*) FILTER (WHERE version_status='review') AS review,
+                  (SELECT count(*) FROM lmc5_source_documents) AS documents,
+                  (SELECT count(*) FROM lmc5_raw_events) AS events,
+                  (SELECT count(*) FROM lmc5_memory_relations WHERE status='current') AS relations
+                FROM lmc5_curated_memories
+                """
+            ).fetchone()
+            categories = conn.execute(
+                """
+                SELECT category,count(*) AS count
+                FROM lmc5_curated_memories
+                WHERE version_status='current'
+                GROUP BY category ORDER BY count DESC,category
+                """
+            ).fetchall()
+            sources = conn.execute(
+                f"""
+                SELECT {source_sql} AS source_type,count(*) AS count
+                FROM lmc5_curated_memories m
+                LEFT JOIN lmc5_source_documents d ON d.id=m.source_document_id
+                WHERE m.version_status='current'
+                GROUP BY source_type ORDER BY count DESC,source_type
+                """
+            ).fetchall()
+            privacy = conn.execute(
+                """
+                SELECT privacy_scope,count(*) AS count
+                FROM lmc5_curated_memories
+                WHERE version_status='current'
+                GROUP BY privacy_scope ORDER BY count DESC,privacy_scope
+                """
+            ).fetchall()
+        return {
+            **self._dashboard_row(totals),
+            "categories": [self._dashboard_row(item) for item in categories],
+            "sources": [self._dashboard_row(item) for item in sources],
+            "privacy": [self._dashboard_row(item) for item in privacy],
+        }
+
+    def list_memories(
+        self,
+        *,
+        query: str = "",
+        source_type: str = "",
+        category: str = "",
+        include_sensitive: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Browse curated memories without changing hit counts or recall vitality."""
+        query = query.strip()[:500]
+        source_type = source_type.strip().lower()
+        category = category.strip().lower()
+        if category and category not in ALLOWED_CATEGORIES:
+            raise ValueError(f"unsupported category: {category}")
+        if source_type and source_type not in {"ltm", "ombre_brain", "manual"}:
+            raise ValueError("source_type must be ltm, ombre_brain, or manual")
+
+        source_sql = self._dashboard_source_sql()
+        conditions = ["m.version_status='current'"]
+        params: list[Any] = []
+        if not include_sensitive:
+            conditions.append("m.privacy_scope IN ('personal','public')")
+        if source_type:
+            conditions.append(f"{source_sql}=%s")
+            params.append(source_type)
+        if category:
+            conditions.append("m.category=%s")
+            params.append(category)
+        if query:
+            pattern = f"%{query}%"
+            conditions.append(
+                "(m.title ILIKE %s OR m.content ILIKE %s OR "
+                "COALESCE(d.original_filename,'') ILIKE %s OR %s=ANY(m.tags))"
+            )
+            params.extend((pattern, pattern, pattern, query))
+
+        where_sql = " AND ".join(conditions)
+        order_sql = "COALESCE(m.valid_at,m.created_at) DESC,m.id DESC"
+        order_params: list[Any] = []
+        if query:
+            order_sql = (
+                "similarity(COALESCE(m.title,'') || ' ' || m.content,%s) DESC," + order_sql
+            )
+            order_params.append(query)
+
+        with self.connect() as conn:
+            total = int(
+                conn.execute(
+                    f"""
+                    SELECT count(*) AS count
+                    FROM lmc5_curated_memories m
+                    LEFT JOIN lmc5_source_documents d ON d.id=m.source_document_id
+                    WHERE {where_sql}
+                    """,
+                    params,
+                ).fetchone()["count"]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT
+                  m.id,{source_sql} AS source_type,m.source,m.category,m.title,m.content,
+                  m.thread,m.tags,m.metadata,m.weight,m.original_importance,m.hit_count,
+                  m.last_hit,m.depth,m.activation_boost,m.protected,m.privacy_scope,
+                  m.surface_allowed,m.fact_key,m.active_fact,m.created_at,m.updated_at,
+                  m.valid_at,d.id AS source_document_id,d.original_filename,d.document_date
+                FROM lmc5_curated_memories m
+                LEFT JOIN lmc5_source_documents d ON d.id=m.source_document_id
+                WHERE {where_sql}
+                ORDER BY {order_sql}
+                LIMIT %s OFFSET %s
+                """,
+                [*params, *order_params, limit, offset],
+            ).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            raw = dict(row)
+            raw["vitality"] = round(float(vitality(raw)), 4)
+            items.append(self._dashboard_row(raw))
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    def list_source_documents(
+        self,
+        *,
+        query: str = "",
+        source_type: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List imported LTM/OB source files with bounded previews."""
+        query = query.strip()[:500]
+        source_type = source_type.strip().lower()
+        if source_type and source_type not in {"ltm", "ombre_brain"}:
+            raise ValueError("source_type must be ltm or ombre_brain")
+        conditions = ["TRUE"]
+        params: list[Any] = []
+        if source_type:
+            conditions.append("source_type=%s")
+            params.append(source_type)
+        if query:
+            pattern = f"%{query}%"
+            conditions.append(
+                "(source_name ILIKE %s OR original_filename ILIKE %s OR content ILIKE %s)"
+            )
+            params.extend((pattern, pattern, pattern))
+        where_sql = " AND ".join(conditions)
+        with self.connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT count(*) AS count FROM lmc5_source_documents WHERE {where_sql}",
+                    params,
+                ).fetchone()["count"]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT id,source_type,source_name,original_filename,document_date,created_at,
+                       metadata,char_length(content) AS characters,
+                       left(content,480) AS preview
+                FROM lmc5_source_documents
+                WHERE {where_sql}
+                ORDER BY COALESCE(document_date,created_at) DESC,id DESC
+                LIMIT %s OFFSET %s
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        return {
+            "items": [self._dashboard_row(row) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_source_document(self, document_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id,source_type,source_name,original_filename,content,document_date,
+                       metadata,created_at,char_length(content) AS characters
+                FROM lmc5_source_documents WHERE id=%s
+                """,
+                (document_id,),
+            ).fetchone()
+        return self._dashboard_row(row) if row else None
 
     @staticmethod
     def content_sha256(content: bytes | str) -> str:

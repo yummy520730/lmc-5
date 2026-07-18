@@ -73,9 +73,12 @@ def test_ltm_import_is_granular_and_marks_sensitive_content():
 
     parsed = parse_ltm_archive(raw)
     assert parsed["preview"]["documents"] == 1
-    assert parsed["preview"]["memories"] == 3
-    assert parsed["preview"]["categories"] == {"health": 1, "worklog": 2}
-    assert parsed["preview"]["privacy"] == {"personal": 2, "sensitive": 1}
+    assert parsed["preview"]["memories"] == 2
+    assert parsed["preview"]["categories"] == {"health": 1, "worklog": 1}
+    assert parsed["preview"]["privacy"] == {"personal": 1, "sensitive": 1}
+    technical = next(memory for memory in parsed["memories"] if memory["category"] == "worklog")
+    assert "部署完成" in technical["content"]
+    assert "后续工作" in technical["content"]
     health = next(memory for memory in parsed["memories"] if memory["category"] == "health")
     assert health["surface_allowed"] is False
     assert health["created_at"].isoformat().startswith("2026-07-17")
@@ -115,6 +118,38 @@ def test_ambiguous_ltm_section_falls_back_to_reviewable_episode():
     assert memory["category"] == "episode"
     assert memory["metadata"]["category_review"] is True
     assert parsed["preview"]["category_review"] == 1
+
+
+def test_ltm_bold_subsection_keeps_all_bullets_and_gets_entity_tags():
+    raw = _zip(
+        {
+            "LTM-Day24.md": """# LTM Day24 · 2026-07-09
+## 新增/更新信息
+**离婚计划（当前版本）**
+- 20号左右请假回湖南接孩子。
+- 月底合同到期不续签，再起诉离婚。
+- 争取抚养权并让律师修改离婚协议。
+
+**工作现状**
+- 职业：韵达快递结算文员。
+- 如果公司裁员，需要考虑N+1赔偿。
+
+**回湖南规划**
+- 回湖南后先安顿，再面试新的工作。
+"""
+        }
+    )
+    parsed = parse_ltm_archive(raw)
+    assert parsed["preview"]["memories"] == 3
+    divorce = next(memory for memory in parsed["memories"] if memory["title"] == "离婚计划（当前版本）")
+    assert divorce["category"] == "legal"
+    assert all(term in divorce["content"] for term in ("20号", "合同", "抚养权"))
+    assert "新增/更新信息" not in divorce["title"]
+    work = next(memory for memory in parsed["memories"] if memory["title"] == "工作现状")
+    assert work["category"] == "worklog"
+    assert "韵达快递" in work["tags"]
+    assert "工作" in work["tags"]
+    assert work["metadata"]["classification_version"] == "structure-v3"
 
 
 def test_zip_path_traversal_is_rejected():

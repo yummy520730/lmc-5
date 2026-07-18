@@ -34,6 +34,21 @@ async def test_public_surface_and_protected_import_api(monkeypatch, tmp_path):
         )
         assert allowed.status_code == 404
 
+        dashboard_rejected = await client.get("/api/dashboard/stats")
+        assert dashboard_rejected.status_code == 401
+
+        monkeypatch.setattr(
+            module.store,
+            "dashboard_stats",
+            lambda: {"memories": 12, "documents": 3, "categories": []},
+        )
+        dashboard = await client.get(
+            "/api/dashboard/stats", headers={"Authorization": "Bearer test-owner-token"}
+        )
+        assert dashboard.status_code == 200
+        assert dashboard.json()["memories"] == 12
+        assert dashboard.headers["cache-control"] == "no-store"
+
 
 @pytest.mark.asyncio
 async def test_expected_mcp_tools_are_registered():

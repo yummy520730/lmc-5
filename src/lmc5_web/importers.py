@@ -177,7 +177,37 @@ def _document_date(text: str, filename: str, timezone_name: str) -> datetime | N
     return None
 
 
+_GENERIC_LTM_TITLE = re.compile(
+    r"^(?:新增\s*/\s*更新|新增|更新)(?:信息|内容|记录|摘要|补丁)?\s*(?:[·:：\-—]\s*)?",
+    re.I,
+)
+
+
+def _semantic_ltm_title(title: str, body: str) -> str:
+    clean = _GENERIC_LTM_TITLE.sub("", title).strip(" ·:：-—")
+    if clean:
+        return clean[:120]
+    labels: list[str] = []
+    for label in re.findall(r"(?m)^\s*\*\*([^*\n]{2,80})\*\*\s*$", body):
+        label = _GENERIC_LTM_TITLE.sub("", label).strip(" ·:：-—")
+        if label and label not in labels:
+            labels.append(label)
+    if labels:
+        return " / ".join(labels[:3])[:120]
+    first = next((line.strip() for line in body.splitlines() if line.strip()), "本日更新")
+    first = re.sub(r"^[-*+]\s+", "", first)
+    first = re.sub(r"^\*\*(.+?)\*\*\s*[：:]?", r"\1 ", first).strip()
+    return first[:120] or "本日更新"
+
+
 def _ltm_sections(text: str) -> list[tuple[str, str]]:
+    """Keep each semantic subsection intact instead of splitting every bullet.
+
+    Daily patches often use a generic H2 followed by standalone bold labels such
+    as “离婚计划（当前版本）”. Each label and all of its following bullets form
+    one memory. Ordinary H2/H3 sections remain one memory regardless of how many
+    list items they contain.
+    """
     raw_sections: list[tuple[str, str]] = []
     title = ""
     body: list[str] = []
@@ -197,27 +227,88 @@ def _ltm_sections(text: str) -> list[tuple[str, str]]:
 
     sections: list[tuple[str, str]] = []
     for parent_title, content in raw_sections:
-        groups: list[list[str]] = []
-        current: list[str] = []
+        chunks: list[tuple[str, str]] = []
+        chunk_title = ""
+        chunk_lines: list[str] = []
+        preamble: list[str] = []
         for line in content.splitlines():
-            if re.match(r"^[-*+]\s+\S", line):
-                if current:
-                    groups.append(current)
-                current = [line]
-            elif current:
-                current.append(line)
-        if current:
-            groups.append(current)
-        useful = ["\n".join(group).strip() for group in groups if len("".join(group).strip()) >= 24]
-        if len(useful) < 2:
-            sections.append((parent_title, content))
-            continue
-        for group in useful:
-            first = re.sub(r"^[-*+]\s+", "", group.splitlines()[0]).strip()
-            bold = re.match(r"\*\*(.+?)\*\*", first)
-            label = (bold.group(1) if bold else first).strip(" ：:")[:80]
-            sections.append((f"{parent_title} · {label}", group))
+            bold_heading = re.match(r"^\s*\*\*([^*\n]{2,120})\*\*\s*$", line)
+            if bold_heading:
+                previous = "\n".join(chunk_lines).strip()
+                if chunk_title and previous:
+                    chunks.append((chunk_title, previous))
+                elif not chunk_title and previous:
+                    preamble.extend(chunk_lines)
+                chunk_title = bold_heading.group(1).strip()
+                chunk_lines = []
+            elif chunk_title:
+                chunk_lines.append(line)
+            else:
+                preamble.append(line)
+        previous = "\n".join(chunk_lines).strip()
+        if chunk_title and previous:
+            chunks.append((chunk_title, previous))
+
+        # Standalone bold labels are true semantic subsections. A lone label is
+        # still useful when its body is substantial; otherwise keep the H2/H3.
+        useful = [(label, body) for label, body in chunks if len(body.strip()) >= 12]
+        if useful:
+            prefix = "\n".join(preamble).strip()
+            if prefix and len(prefix) >= 24:
+                sections.append((_semantic_ltm_title(parent_title, prefix), prefix))
+            for label, body in useful:
+                leaf_title = _semantic_ltm_title(label, body)
+                keep_parent = not _GENERIC_LTM_TITLE.match(parent_title)
+                title = (
+                    f"{parent_title} · {leaf_title}"
+                    if keep_parent and leaf_title != parent_title
+                    else leaf_title
+                )
+                sections.append((title, body))
+        else:
+            sections.append((_semantic_ltm_title(parent_title, content), content))
     return sections
+
+
+_TOPIC_TAGS = (
+    "裁员", "被裁", "赔偿", "劳动合同", "合同", "续签", "离婚", "离婚协议",
+    "抚养权", "律师", "工作", "上班", "公司", "工资", "岗位", "搬家", "回家",
+    "经期", "健康", "项目", "部署", "小窝", "LTM", "Ombre Brain",
+)
+
+
+def _ltm_entity_tags(title: str, body: str, aliases: tuple[str, ...]) -> list[str]:
+    """Extract conservative entity/topic tags without sending private text to an LLM."""
+    text = f"{title}\n{body}"
+    tags: set[str] = {alias for alias in aliases if alias and alias in text}
+    for term in _TOPIC_TAGS:
+        if term.casefold() in text.casefold():
+            tags.add(term)
+
+    for label in re.findall(r"\*\*([^*\n]{2,50})\*\*", text):
+        clean = re.sub(r"[（(][^）)]*[）)]", "", label).strip(" ·:：-—")
+        if clean and not re.search(r"[。！？!?]", clean):
+            tags.add(clean[:40])
+
+    entity_patterns = (
+        r"(?:全名|姓名|丈夫|妻子|女儿|儿子|孩子)[：:\s]+([\u4e00-\u9fff·]{2,8})",
+        r"(?:职业|任职|就职|工作地点)[：:\s]+([\u4e00-\u9fffA-Za-z0-9·_-]{2,20})",
+        r"(?:职业|任职|就职|工作地点)[^\n]{0,30}?[（(]([\u4e00-\u9fffA-Za-z0-9·_-]{2,12})[）)]",
+        r"(?:回|去|来自|籍贯[：:]?)([\u4e00-\u9fff]{2,8})(?=后|工作|生活|省|市|地区|[，。；、\s]|$)",
+        r"([\u4e00-\u9fffA-Za-z0-9·_-]{2,20}(?:快递|物流|公司|集团|科技|银行|医院|法院|学校))",
+    )
+    for pattern in entity_patterns:
+        for match in re.findall(pattern, text, re.I):
+            entity = str(match).strip(" ·:：-—（）()")
+            if 2 <= len(entity) <= 24:
+                tags.add(entity)
+                if any(word in entity for word in ("快递", "物流", "公司", "集团")):
+                    tags.add("工作")
+
+    for token in re.findall(r"\b[A-Z][A-Za-z0-9_.-]{2,30}\b", text):
+        if token not in {"LTM", "Day"}:
+            tags.add(token)
+    return sorted(tags, key=lambda item: (len(item), item))[:32]
 
 
 def _has_any(text: str, words: tuple[str, ...]) -> bool:
@@ -304,12 +395,16 @@ def _ltm_category(
             "health", "health", False, 1.9, "section:health",
         ),
         (
-            ("法律记录", "离婚协议"),
+            ("法律记录", "离婚协议", "离婚计划", "起诉离婚", "抚养权"),
             "legal", "legal", False, 2.0, "section:legal",
         ),
         (
             ("待办更新", "项目优先级", "明日预告", "回湖南待办", "未兑/进行中"),
             "tasks", "projects", False, 1.7, "section:tasks",
+        ),
+        (
+            ("工作现状", "工作更新", "公司现状", "劳动合同", "裁员", "续签"),
+            "worklog", "work", False, 2.0, "section:employment",
         ),
         (
             (
@@ -342,7 +437,10 @@ def _ltm_category(
         ("健康", "经期", "身体数据", "药物", "医院", "诊断", "复诊", "睡眠", "深睡", "心率", "过敏"),
     ):
         return "health", "health", False, 1.9, 0.93, "label:health"
-    if _has_any(focus, ("法律", "离婚协议", "合同", "罚单")):
+    if _has_any(
+        focus,
+        ("法律", "离婚协议", "离婚计划", "起诉离婚", "抚养权", "律师", "合同", "罚单"),
+    ):
         return "legal", "legal", False, 2.0, 0.93, "label:legal"
     if _has_any(focus, ("待办", "优先级", "进行中", "未兑", "明日预告")):
         return "tasks", "projects", False, 1.7, 0.90, "label:tasks"
@@ -474,12 +572,20 @@ def parse_ltm_archive(archive: bytes, timezone_name: str = "Asia/Shanghai") -> d
                     "title": title[:500],
                     "content": body,
                     "thread": thread,
-                    "tags": ["ltm", "baseline" if baseline else "daily_patch"],
+                    "tags": list(
+                        dict.fromkeys(
+                            [
+                                "ltm",
+                                "baseline" if baseline else "daily_patch",
+                                *_ltm_entity_tags(title, body, relationship_aliases),
+                            ]
+                        )
+                    ),
                     "metadata": {
                         "source_file": normalized_name,
                         "section_index": index,
                         "baseline": baseline,
-                        "classification_version": "structure-v2",
+                        "classification_version": "structure-v3",
                         "category_confidence": confidence,
                         "category_reason": reason,
                         "category_review": confidence < 0.70,

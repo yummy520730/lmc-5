@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from lmc5_web.config import Settings
-from lmc5_web.store import MemoryStore
+from lmc5_web.store import MemoryStore, _query_concepts, _query_coverage
 
 
 def test_settings_accepts_zeabur_postgres_alias(monkeypatch, tmp_path):
@@ -28,6 +28,80 @@ def test_memory_validation_rejects_unsupported_values(field, value):
     memory = {"title": "Title", "content": "Body", field: value}
     with pytest.raises(ValueError):
         MemoryStore._validate_memory(memory)
+
+
+def test_dashboard_filters_reject_unknown_values():
+    store = MemoryStore("unused")
+    with pytest.raises(ValueError, match="source_type"):
+        store.list_memories(source_type="unknown")
+    with pytest.raises(ValueError, match="category"):
+        store.list_memories(category="unknown")
+    with pytest.raises(ValueError, match="source_type"):
+        store.list_source_documents(source_type="manual")
+
+
+def test_multi_term_query_matches_entities_and_synonyms_across_memory_text():
+    concepts = _query_concepts("裁员 工作 韵达")
+    memory = {
+        "title": "工作现状",
+        "content": "在韵达快递任职，如果被裁需要核算赔偿。",
+        "tags": ["韵达快递", "工作"],
+    }
+    assert _query_coverage(memory, concepts) == 1.0
+
+
+def test_ltm_import_links_sections_and_archives_old_split_units():
+    relation_pairs = []
+
+    class Result:
+        def __init__(self, row=None, rowcount=0):
+            self.row = row
+            self.rowcount = rowcount
+
+        def fetchone(self):
+            return self.row
+
+    class FakeConnection:
+        def execute(self, sql, params=None, **kwargs):
+            normalized = " ".join(sql.split())
+            if "INSERT INTO lmc5_source_documents" in normalized:
+                return Result({"id": 41})
+            if "SET version_status='archived'" in normalized:
+                return Result(rowcount=4)
+            if "INSERT INTO lmc5_memory_relations" in normalized:
+                relation_pairs.append((params[0], params[1]))
+                return Result({"id": len(relation_pairs)})
+            if "INSERT INTO lmc5_import_runs" in normalized:
+                return Result()
+            raise AssertionError(normalized)
+
+    class FakeStore(MemoryStore):
+        @contextmanager
+        def connect(self):
+            yield FakeConnection()
+
+        def _upsert_memory(self, conn, data):
+            return int(data["legacy_id"]), True
+
+    result = FakeStore("unused").import_records(
+        source_type="ltm",
+        archive_sha256="archive",
+        documents=[
+            {
+                "key": "day24",
+                "filename": "LTM-Day24.md",
+                "sha256": "document",
+                "content": "body",
+            }
+        ],
+        memories=[
+            {"document_key": "day24", "legacy_id": str(memory_id)}
+            for memory_id in (1, 2, 3)
+        ],
+    )
+    assert result["archived_stale_memories"] == 4
+    assert result["same_document_relations_created"] == 3
+    assert relation_pairs == [(1, 2), (1, 3), (2, 3)]
 
 
 def test_recall_reserves_space_for_linked_memory_and_backfills():

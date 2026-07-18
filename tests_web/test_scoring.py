@@ -59,3 +59,18 @@ def test_recency_uses_event_time_not_last_recall_time():
     now = datetime.now(timezone.utc)
     old = {"created_at": now - timedelta(days=60), "last_hit": now}
     assert recency_score(old, now=now) == 0.25
+
+
+def test_sensitive_memory_has_no_score_penalty_when_explicitly_recalled():
+    now = datetime.now(timezone.utc)
+    base = {
+        "weight": 2.0,
+        "category": "legal",
+        "protected": False,
+        "created_at": now,
+        "hit_count": 1,
+        "arousal": 0.3,
+    }
+    personal_score, _ = recall_score({**base, "privacy_scope": "personal"}, 0.8, now=now)
+    sensitive_score, _ = recall_score({**base, "privacy_scope": "sensitive"}, 0.8, now=now)
+    assert sensitive_score == personal_score

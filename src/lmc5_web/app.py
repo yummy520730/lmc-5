@@ -371,6 +371,82 @@ async def health(_: Request) -> JSONResponse:
     )
 
 
+def _bounded_query_int(request: Request, name: str, default: int, low: int, high: int) -> int:
+    raw = request.query_params.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    return max(low, min(high, value))
+
+
+def _query_bool(request: Request, name: str, default: bool = False) -> bool:
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _private_json(data: dict, *, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(data, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+async def dashboard_stats(_: Request) -> JSONResponse:
+    try:
+        return _private_json(await asyncio.to_thread(store.dashboard_stats))
+    except Exception:
+        log.exception("dashboard stats failed")
+        return _private_json({"error": "memory dashboard is unavailable"}, status_code=503)
+
+
+async def dashboard_memories(request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.to_thread(
+            store.list_memories,
+            query=request.query_params.get("q", ""),
+            source_type=request.query_params.get("source_type", ""),
+            category=request.query_params.get("category", ""),
+            include_sensitive=_query_bool(request, "include_sensitive"),
+            limit=_bounded_query_int(request, "limit", 20, 1, 100),
+            offset=_bounded_query_int(request, "offset", 0, 0, 1_000_000),
+        )
+        return _private_json(result)
+    except ValueError as exc:
+        return _private_json({"error": str(exc)}, status_code=400)
+    except Exception:
+        log.exception("dashboard memory listing failed")
+        return _private_json({"error": "memory list is unavailable"}, status_code=503)
+
+
+async def dashboard_documents(request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.to_thread(
+            store.list_source_documents,
+            query=request.query_params.get("q", ""),
+            source_type=request.query_params.get("source_type", ""),
+            limit=_bounded_query_int(request, "limit", 20, 1, 100),
+            offset=_bounded_query_int(request, "offset", 0, 0, 1_000_000),
+        )
+        return _private_json(result)
+    except ValueError as exc:
+        return _private_json({"error": str(exc)}, status_code=400)
+    except Exception:
+        log.exception("dashboard document listing failed")
+        return _private_json({"error": "source document list is unavailable"}, status_code=503)
+
+
+async def dashboard_document(request: Request) -> JSONResponse:
+    try:
+        document_id = int(request.path_params["document_id"])
+        document = await asyncio.to_thread(store.get_source_document, document_id)
+        if document is None:
+            return _private_json({"error": "source document not found"}, status_code=404)
+        return _private_json(document)
+    except Exception:
+        log.exception("dashboard document read failed")
+        return _private_json({"error": "source document is unavailable"}, status_code=503)
+
+
 async def import_archive(request: Request) -> JSONResponse:
     source_type = request.path_params["source_type"]
     parser = {"ombre": parse_ombre_archive, "ltm": parse_ltm_archive}.get(source_type)
@@ -455,6 +531,10 @@ mcp_http_app = mcp.streamable_http_app()
 routes = [
     Route("/", homepage, methods=["GET"]),
     Route("/healthz", health, methods=["GET"]),
+    Route("/api/dashboard/stats", dashboard_stats, methods=["GET"]),
+    Route("/api/dashboard/memories", dashboard_memories, methods=["GET"]),
+    Route("/api/dashboard/documents", dashboard_documents, methods=["GET"]),
+    Route("/api/dashboard/documents/{document_id:int}", dashboard_document, methods=["GET"]),
     Route("/api/import/{source_type}", import_archive, methods=["POST"]),
     Mount("/", app=mcp_http_app),
 ]

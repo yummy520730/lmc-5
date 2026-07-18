@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 - 2026-07-18
+
+- Add owner-token-protected REST endpoints for memory dashboard statistics.
+- Add paginated browsing and search for curated LTM/Ombre memories.
+- Add paginated source-document browsing with full LTM document details.
+- Add the Cloudflare small-home Worker proxy and Memory-page integration guide.
+- Keep all bullets under one semantic LTM subsection instead of creating one-line memories.
+- Rewrite generic daily-patch titles and extract conservative entity/topic tags locally.
+- Expand multi-term queries with concept coverage and common employment/legal synonyms.
+- Keep explicitly requested sensitive memories at normal recall weight.
+- Link sections from the same LTM Day patch and archive stale split records on re-import.
+
 ## Unreleased
 
 ### Claude Web 0.2.0

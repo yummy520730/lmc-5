@@ -182,11 +182,56 @@ _GENERIC_LTM_TITLE = re.compile(
     re.I,
 )
 
+_WEAK_LTM_TITLE = re.compile(
+    r"^(?:[^：:｜·]{1,16}(?:补充(?:信息)?|的状态更新)|"
+    r"关系(?:进展|动态更新|状态更新)|技术(?:/项目|资产更新|进展|规划)|"
+    r"健康数据|产出(?:清单)?|待办(?:更新)?|共(?:看|读|听|玩|看/共听|读/共看)进度|"
+    r"情绪状态|其他记录)$",
+    re.I,
+)
+
+
+def _body_title_hint(body: str) -> str:
+    hints: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line or line == "---" or line.startswith("|"):
+            continue
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"^\d+[.)、]\s*", "", line)
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+        line = re.sub(r"`([^`]+)`", r"\1", line)
+        line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
+        line = re.split(r"\s*(?:——|—{2,}|。|；)\s*", line, maxsplit=1)[0]
+        line = line.strip(" ·:：-—，,。；;")
+        if len(line) < 3:
+            continue
+        if len(line) > 42:
+            line = line[:42].rstrip(" ·:：-—，,。；;")
+            if line.count('"') % 2:
+                line += '"'
+            if line.count("“") > line.count("”"):
+                line += "”"
+            if line.count("‘") > line.count("’"):
+                line += "’"
+        if line not in hints:
+            hints.append(line)
+        if len(hints) == 2:
+            break
+    return " / ".join(hints)[:86]
+
+
+def _classification_ltm_title(title: str) -> str:
+    """Remove only importer-generated semantic suffixes before classification."""
+    base, separator, _ = title.partition("：")
+    return base if separator and _WEAK_LTM_TITLE.fullmatch(base) else title
+
 
 def _semantic_ltm_title(title: str, body: str) -> str:
     clean = _GENERIC_LTM_TITLE.sub("", title).strip(" ·:：-—")
     if clean:
-        return clean[:120]
+        hint = _body_title_hint(body) if _WEAK_LTM_TITLE.fullmatch(clean) else ""
+        return (f"{clean}：{hint}" if hint else clean)[:120]
     labels: list[str] = []
     for label in re.findall(r"(?m)^\s*\*\*([^*\n]{2,80})\*\*\s*$", body):
         label = _GENERIC_LTM_TITLE.sub("", label).strip(" ·:：-—")
@@ -358,7 +403,8 @@ def _ltm_category(
     instead of being confidently forced into the wrong bucket.
     """
     parent, separator, leaf = title.partition(" · ")
-    focus = leaf if separator else parent
+    parent = _classification_ltm_title(parent)
+    focus = _classification_ltm_title(leaf if separator else parent)
 
     if baseline:
         baseline_rules = (

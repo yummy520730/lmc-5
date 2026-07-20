@@ -70,6 +70,37 @@ def _query_coverage(memory: dict[str, Any], concepts: list[tuple[str, ...]]) -> 
     return matched / len(concepts)
 
 
+def _select_recall_seeds(
+    ranked: list[dict[str, Any]],
+    *,
+    lexical_slots: int,
+    include_sensitive: bool,
+) -> list[dict[str, Any]]:
+    """Reserve explicit sensitive matches before graph expansion.
+
+    Sensitive memories never receive a score penalty. When the caller explicitly
+    opts in, up to half of the lexical slots are reserved for sensitive memories
+    that matched a query term in title, body, or tags. The remaining slots keep
+    the ordinary global score order.
+    """
+    if not include_sensitive:
+        return ranked[:lexical_slots]
+
+    reserve = max(1, (lexical_slots + 1) // 2)
+    exact_sensitive = [
+        item for item in ranked if item.get("_explicit_sensitive_match")
+    ][:reserve]
+    selected = list(exact_sensitive)
+    seen = {int(item["id"]) for item in selected}
+    for item in ranked:
+        if len(selected) >= lexical_slots:
+            break
+        if int(item["id"]) not in seen:
+            selected.append(item)
+            seen.add(int(item["id"]))
+    return selected
+
+
 class StoreUnavailable(RuntimeError):
     pass
 
@@ -268,8 +299,8 @@ class MemoryStore:
         concepts = _query_concepts(query)
         expanded_terms = list(dict.fromkeys(term for group in concepts for term in group))
         patterns = [f"%{term}%" for term in expanded_terms]
-        lexical_candidate_limit = max(limit * 6, 40)
-        recent_candidate_limit = max(limit * 4, 24)
+        lexical_candidate_limit = max(limit * (10 if include_sensitive else 6), 80 if include_sensitive else 40)
+        recent_candidate_limit = max(limit * (6 if include_sensitive else 4), 40 if include_sensitive else 24)
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -314,17 +345,28 @@ class MemoryStore:
             for row in rows:
                 item = dict(row)
                 live = vitality(item)
+                term_hits = int(item.pop("term_hits", 0) or 0)
                 lexical = max(
                     0.0,
                     float(item.pop("lexical_score") or 0),
                     _query_coverage(item, concepts),
                 )
-                item.pop("term_hits", None)
                 final, breakdown = recall_score(item, lexical)
+                explicit_sensitive_match = bool(
+                    include_sensitive
+                    and item.get("privacy_scope") == "sensitive"
+                    and term_hits > 0
+                )
+                item["_explicit_sensitive_match"] = explicit_sensitive_match
+                if explicit_sensitive_match:
+                    breakdown["privacy_multiplier"] = 1.0
+                    breakdown["explicit_sensitive_match"] = 1.0
                 item["score"] = final
                 item["score_breakdown"] = breakdown
                 item["vitality"] = live
                 item["channels"] = ["lexical", "entity_terms", "vitality", "recency"]
+                if explicit_sensitive_match:
+                    item["channels"].insert(2, "explicit_sensitive")
                 scored.append((final, item))
             scored.sort(key=lambda pair: pair[0], reverse=True)
             ranked = [item for _, item in scored]
@@ -332,7 +374,11 @@ class MemoryStore:
             # a full lexical result page would make the relation graph invisible.
             graph_slots = min(2, max(0, limit - 1))
             lexical_slots = max(1, limit - graph_slots)
-            selected = ranked[:lexical_slots]
+            selected = _select_recall_seeds(
+                ranked,
+                lexical_slots=lexical_slots,
+                include_sensitive=include_sensitive,
+            )
 
             seed_ids = [int(item["id"]) for item in selected]
             if seed_ids:

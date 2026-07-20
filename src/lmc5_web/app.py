@@ -119,10 +119,11 @@ if oauth_provider is not None:
 
 @mcp.tool()
 async def memory_time() -> dict:
-    """Return the actual current Beijing time for the reply status line.
+    """Return the actual current Beijing time when precise time is needed.
 
-    Call before every reply when the Project identity kernel requires timeline
-    continuity. Never estimate the time or reuse a previous result.
+    Do not call this tool before every reply. Use it for a new-window first reply,
+    after a long pause or date boundary, when the available system time is
+    uncertain, or when exact time materially matters.
     """
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     if 5 <= now.hour < 11:
@@ -141,7 +142,7 @@ async def memory_time() -> dict:
         "date": now.strftime("%y/%m/%d"),
         "time": now.strftime("%H:%M:%S"),
         "period": period,
-        "format_hint": f"[{now:%y/%m/%d}｜{period}｜状态：一句短状态 emoji]",
+        "format_hint": f"[{now:%y/%m/%d｜%H:%M}]",
     }
 
 

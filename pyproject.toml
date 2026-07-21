@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmc5-claude-web"
-version = "0.3.0"
+version = "0.3.1"
 description = "A private LMC-5 PostgreSQL memory service for Claude Web remote MCP."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+  "httpx>=0.28,<1",
   "mcp==1.28.1",
   "psycopg[binary]>=3.2,<4",
   "python-multipart>=0.0.20,<1",
@@ -33,7 +34,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.28,<1",
   "pytest>=8.4,<10",
   "pytest-asyncio>=1.1,<2",
 ]

@@ -511,6 +511,7 @@ async def dashboard_memories(request: Request) -> JSONResponse:
             query=request.query_params.get("q", ""),
             source_type=request.query_params.get("source_type", ""),
             category=request.query_params.get("category", ""),
+            version_status=request.query_params.get("status", "current"),
             include_sensitive=_query_bool(request, "include_sensitive"),
             limit=_bounded_query_int(request, "limit", 20, 1, 100),
             offset=_bounded_query_int(request, "offset", 0, 0, 1_000_000),
@@ -527,15 +528,36 @@ async def dashboard_memory_update(request: Request) -> JSONResponse:
     try:
         memory_id = int(request.path_params["memory_id"])
         payload = await request.json()
-        if not isinstance(payload, dict) or set(payload) != {"weight"}:
-            raise ValueError("request body must contain only weight")
-        result = await asyncio.to_thread(
-            store.update_memory_weight,
-            memory_id,
-            float(payload["weight"]),
-        )
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        if set(payload) == {"weight"}:
+            result = await asyncio.to_thread(
+                store.update_memory_weight,
+                memory_id,
+                float(payload["weight"]),
+            )
+        elif payload == {"action": "restore"}:
+            result = await asyncio.to_thread(store.restore_memory, memory_id)
+        elif set(payload) == {"action", "replacement_id"} and payload["action"] == "replace":
+            result = await asyncio.to_thread(
+                store.replace_memory_with_existing,
+                memory_id,
+                int(payload["replacement_id"]),
+            )
+        elif set(payload) == {"protected"} and isinstance(payload["protected"], bool):
+            result = await asyncio.to_thread(
+                store.update_memory_protection,
+                memory_id,
+                payload["protected"],
+            )
+        else:
+            raise ValueError(
+                "request body must set weight, protected, action=restore, or action=replace"
+            )
         if result["status"] == "not_found":
-            return _private_json({"error": "current memory not found"}, status_code=404)
+            return _private_json({"error": "memory not found for this action"}, status_code=404)
+        if result["status"] == "blocked":
+            return _private_json({"error": result["reason"]}, status_code=409)
         return _private_json(result)
     except (TypeError, ValueError) as exc:
         return _private_json({"error": str(exc)}, status_code=400)

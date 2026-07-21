@@ -1920,6 +1920,7 @@ class MemoryStore:
         query: str = "",
         source_type: str = "",
         category: str = "",
+        version_status: str = "current",
         include_sensitive: bool = False,
         limit: int = 20,
         offset: int = 0,
@@ -1928,14 +1929,25 @@ class MemoryStore:
         query = query.strip()[:500]
         source_type = source_type.strip().lower()
         category = category.strip().lower()
+        version_status = version_status.strip().lower() or "current"
         if category and category not in ALLOWED_CATEGORIES:
             raise ValueError(f"unsupported category: {category}")
         if source_type and source_type not in {"ltm", "ombre_brain", "manual"}:
             raise ValueError("source_type must be ltm, ombre_brain, or manual")
+        if version_status not in {"current", "archived"}:
+            raise ValueError("version_status must be current or archived")
 
         source_sql = self._dashboard_source_sql()
-        conditions = ["m.version_status='current'"]
-        params: list[Any] = []
+        conditions = ["m.version_status=%s"]
+        params: list[Any] = [version_status]
+        if version_status == "archived":
+            # The recycle bin is intentionally narrower than the cold archive.
+            # Import cleanup also uses version_status='archived', but those stale
+            # split records must not be restored from the owner dashboard.
+            conditions.append(
+                "EXISTS (SELECT 1 FROM lmc5_dashboard_audit a "
+                "WHERE a.memory_id=m.id AND a.action='archive')"
+            )
         if not include_sensitive:
             conditions.append("m.privacy_scope IN ('personal','public')")
         if source_type:
@@ -1953,7 +1965,11 @@ class MemoryStore:
             params.extend((pattern, pattern, pattern, query))
 
         where_sql = " AND ".join(conditions)
-        order_sql = "COALESCE(m.valid_at,m.created_at) DESC,m.id DESC"
+        order_sql = (
+            "m.invalid_at DESC,m.id DESC"
+            if version_status == "archived"
+            else "COALESCE(m.valid_at,m.created_at) DESC,m.id DESC"
+        )
         order_params: list[Any] = []
         if query:
             order_sql = (
@@ -1980,7 +1996,8 @@ class MemoryStore:
                   m.thread,m.tags,m.metadata,m.weight,m.original_importance,m.hit_count,
                   m.last_hit,m.depth,m.activation_boost,m.protected,m.privacy_scope,
                   m.surface_allowed,m.fact_key,m.active_fact,m.created_at,m.updated_at,
-                  m.valid_at,d.id AS source_document_id,d.original_filename,d.document_date
+                  m.valid_at,m.invalid_at,m.version_status,
+                  d.id AS source_document_id,d.original_filename,d.document_date
                 FROM lmc5_curated_memories m
                 LEFT JOIN lmc5_source_documents d ON d.id=m.source_document_id
                 WHERE {where_sql}
@@ -2004,7 +2021,7 @@ class MemoryStore:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT id,title,weight,protected,active_fact,version_status
+                SELECT id,title,weight,protected,active_fact,version_status,surface_allowed
                 FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
                 """,
                 (memory_id,),
@@ -2032,12 +2049,147 @@ class MemoryStore:
             )
         return {"status": "updated", "memory": self._dashboard_row(updated)}
 
+    def update_memory_protection(self, memory_id: int, protected: bool) -> dict[str, Any]:
+        """Explicitly lock or unlock one current memory, with an audit trail."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id,title,weight,protected,active_fact,version_status
+                FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
+                """,
+                (memory_id,),
+            ).fetchone()
+            if row is None or row["version_status"] != "current":
+                return {"status": "not_found"}
+            if row["active_fact"] and not protected:
+                return {
+                    "status": "blocked",
+                    "reason": "current active fact must be corrected before it can be unlocked",
+                }
+            previous = bool(row["protected"])
+            if previous == protected:
+                return {
+                    "status": "unchanged",
+                    "memory": self._dashboard_row(row),
+                }
+            updated = conn.execute(
+                """
+                UPDATE lmc5_curated_memories SET protected=%s,updated_at=NOW()
+                WHERE id=%s
+                RETURNING id,title,weight,protected,active_fact,version_status,updated_at
+                """,
+                (protected, memory_id),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO lmc5_dashboard_audit(memory_id,action,before_state,after_state)
+                VALUES (%s,%s,%s,%s)
+                """,
+                (
+                    memory_id,
+                    "protect" if protected else "unprotect",
+                    Jsonb({"protected": previous}),
+                    Jsonb({"protected": protected}),
+                ),
+            )
+        return {"status": "updated", "memory": self._dashboard_row(updated)}
+
+    def replace_memory_with_existing(
+        self,
+        memory_id: int,
+        replacement_id: int,
+    ) -> dict[str, Any]:
+        """Supersede one current fact with an already-curated current memory."""
+        if memory_id == replacement_id:
+            raise ValueError("replacement memory must be different")
+        with self.connect() as conn:
+            old = conn.execute(
+                """
+                SELECT id,title,fact_key,active_fact,protected,version_status
+                FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
+                """,
+                (memory_id,),
+            ).fetchone()
+            replacement = conn.execute(
+                """
+                SELECT id,title,fact_key,active_fact,protected,version_status
+                FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
+                """,
+                (replacement_id,),
+            ).fetchone()
+            if old is None or old["version_status"] != "current":
+                return {"status": "not_found", "which": "memory"}
+            if replacement is None or replacement["version_status"] != "current":
+                return {"status": "not_found", "which": "replacement"}
+            if not old["active_fact"]:
+                return {
+                    "status": "blocked",
+                    "reason": "only a current active fact can be replaced",
+                }
+            if (
+                replacement["active_fact"]
+                and replacement["fact_key"]
+                and replacement["fact_key"] != old["fact_key"]
+            ):
+                return {
+                    "status": "blocked",
+                    "reason": "replacement is already the active version of another fact",
+                }
+            conn.execute(
+                """
+                UPDATE lmc5_curated_memories
+                SET version_status='superseded',active_fact=FALSE,superseded_by=%s,
+                  invalid_at=NOW(),surface_allowed=FALSE,updated_at=NOW()
+                WHERE id=%s
+                """,
+                (replacement_id, memory_id),
+            )
+            promoted = conn.execute(
+                """
+                UPDATE lmc5_curated_memories
+                SET fact_key=COALESCE(%s,fact_key),active_fact=TRUE,
+                  valid_at=COALESCE(valid_at,NOW()),updated_at=NOW()
+                WHERE id=%s
+                RETURNING id,title,fact_key,active_fact,protected,version_status,updated_at
+                """,
+                (old["fact_key"], replacement_id),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO lmc5_dashboard_audit(memory_id,action,before_state,after_state)
+                VALUES (%s,'replace',%s,%s)
+                """,
+                (
+                    memory_id,
+                    Jsonb(
+                        {
+                            "title": old["title"],
+                            "fact_key": old["fact_key"],
+                            "active_fact": True,
+                            "version_status": "current",
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "version_status": "superseded",
+                            "replacement_id": replacement_id,
+                            "replacement_title": replacement["title"],
+                        }
+                    ),
+                ),
+            )
+        return {
+            "status": "replaced",
+            "superseded_memory_id": memory_id,
+            "replacement": self._dashboard_row(promoted),
+        }
+
     def archive_memory(self, memory_id: int) -> dict[str, Any]:
         """Soft-delete one ordinary memory while preserving recovery and audit."""
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT id,title,weight,protected,active_fact,version_status
+                SELECT id,title,weight,protected,active_fact,version_status,surface_allowed
                 FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
                 """,
                 (memory_id,),
@@ -2072,6 +2224,7 @@ class MemoryStore:
                             "title": row["title"],
                             "weight": float(row["weight"]),
                             "version_status": "current",
+                            "surface_allowed": bool(row["surface_allowed"]),
                         }
                     ),
                     Jsonb({"version_status": "archived"}),
@@ -2082,6 +2235,62 @@ class MemoryStore:
             "memory_id": memory_id,
             "recoverable": True,
         }
+
+    def restore_memory(self, memory_id: int) -> dict[str, Any]:
+        """Restore one dashboard-archived memory without reviving other historical states."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id,title,weight,protected,active_fact,version_status
+                FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
+                """,
+                (memory_id,),
+            ).fetchone()
+            if row is None or row["version_status"] != "archived":
+                return {"status": "not_found"}
+            audit = conn.execute(
+                """
+                SELECT before_state FROM lmc5_dashboard_audit
+                WHERE memory_id=%s AND action='archive'
+                ORDER BY created_at DESC,id DESC LIMIT 1
+                """,
+                (memory_id,),
+            ).fetchone()
+            if audit is None:
+                # Non-dashboard archives belong to import cleanup/cold history.
+                # They are not recycle-bin entries and must stay untouched.
+                return {"status": "not_found"}
+            before_state = dict(audit["before_state"] or {}) if audit else {}
+            # Older archives did not record this flag. False is the safe fallback:
+            # the memory becomes searchable again without entering random pulse.
+            surface_allowed = bool(before_state.get("surface_allowed", False))
+            restored = conn.execute(
+                """
+                UPDATE lmc5_curated_memories
+                SET version_status='current',invalid_at=NULL,surface_allowed=%s,updated_at=NOW()
+                WHERE id=%s
+                RETURNING id,title,weight,protected,active_fact,version_status,
+                  surface_allowed,updated_at
+                """,
+                (surface_allowed, memory_id),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO lmc5_dashboard_audit(memory_id,action,before_state,after_state)
+                VALUES (%s,'restore',%s,%s)
+                """,
+                (
+                    memory_id,
+                    Jsonb({"version_status": "archived"}),
+                    Jsonb(
+                        {
+                            "version_status": "current",
+                            "surface_allowed": surface_allowed,
+                        }
+                    ),
+                ),
+            )
+        return {"status": "restored", "memory": self._dashboard_row(restored)}
 
     def list_source_documents(
         self,

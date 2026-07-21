@@ -215,8 +215,23 @@ CREATE TABLE IF NOT EXISTS lmc5_dashboard_audit (
     after_state JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT lmc5_dashboard_audit_action_check
-        CHECK (action IN ('update_weight','archive','restore'))
+        CHECK (action IN ('update_weight','archive','restore','protect','unprotect','replace'))
 );
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname='lmc5_dashboard_audit_action_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%replace%'
+    ) THEN
+        ALTER TABLE lmc5_dashboard_audit
+            DROP CONSTRAINT lmc5_dashboard_audit_action_check;
+        ALTER TABLE lmc5_dashboard_audit
+            ADD CONSTRAINT lmc5_dashboard_audit_action_check
+            CHECK (action IN ('update_weight','archive','restore','protect','unprotect','replace'));
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS lmc5_dashboard_audit_memory_idx
     ON lmc5_dashboard_audit(memory_id, created_at DESC);

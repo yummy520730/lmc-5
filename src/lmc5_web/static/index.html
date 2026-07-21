@@ -38,6 +38,15 @@
       <div class="row"><input name="apply" type="checkbox" id="ltm-apply"><label for="ltm-apply">确认写入数据库（不勾选只预览）</label></div>
       <button class="secondary" type="submit">检查 / 导入 LTM</button>
     </form>
+
+    <form class="card" id="claude-form">
+      <h2>导入 Claude 完整记录</h2>
+      <p class="muted">读取数据导出 zip 中双方可见的聊天正文；思考链、工具载荷和凭据不会进入记忆库。</p>
+      <label>访问密码</label><input class="token" type="password" autocomplete="current-password" required>
+      <label>Claude 数据导出.zip</label><input name="archive" type="file" accept=".zip,application/zip" required>
+      <div class="row"><input name="apply" type="checkbox" id="claude-apply"><label for="claude-apply">确认写入原始事件（不勾选只预览）</label></div>
+      <button type="submit">检查 / 导入 Claude</button>
+    </form>
   </section>
 
   <section class="card">
@@ -61,6 +70,7 @@ async function submit(event,kind){
 }
 document.querySelector('#ombre-form').addEventListener('submit',e=>submit(e,'ombre'));
 document.querySelector('#ltm-form').addEventListener('submit',e=>submit(e,'ltm'));
+document.querySelector('#claude-form').addEventListener('submit',e=>submit(e,'claude'));
 checkHealth();
 </script>
 </body>

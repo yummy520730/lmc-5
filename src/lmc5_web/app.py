@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -20,6 +21,12 @@ from starlette.routing import Mount, Route
 from .auth import TokenAuthMiddleware
 from .config import Settings
 from .importers import parse_ltm_archive, parse_ombre_archive
+from .intelligence import (
+    GeminiDreamProposer,
+    GeminiEmbedding,
+    LocalHashEmbedding,
+    local_dream_candidates,
+)
 from .oauth import LMC5OAuthProvider, OAuthLoginError, OAUTH_SCOPES, render_oauth_login
 from .store import MemoryStore
 
@@ -27,7 +34,49 @@ from .store import MemoryStore
 log = logging.getLogger("lmc5_web")
 settings = Settings.from_env()
 settings.prepare_directories()
-store = MemoryStore(settings.database_url)
+
+
+def _build_embedding_provider():
+    if settings.embed_provider == "none":
+        return None
+    if settings.embed_provider == "gemini":
+        if not settings.gemini_api_key:
+            log.warning("Gemini embedding is configured but LMC5_GEMINI_API_KEY is missing")
+            return None
+        return GeminiEmbedding(
+            api_key=settings.gemini_api_key,
+            model=settings.embed_model or "gemini-embedding-001",
+            dimension=settings.embed_dimension,
+        )
+    return LocalHashEmbedding(
+        model=settings.embed_model or "char-ngram-v1",
+        dimension=settings.embed_dimension,
+    )
+
+
+def _build_dream_proposer():
+    if settings.dream_mode == "off":
+        return None
+    if settings.dream_provider == "gemini":
+        if not settings.gemini_api_key:
+            log.warning("Gemini dream is configured but LMC5_GEMINI_API_KEY is missing")
+            return None
+        return GeminiDreamProposer(
+            api_key=settings.gemini_api_key,
+            model=settings.dream_model,
+        ).propose
+    return local_dream_candidates
+
+
+embedding_provider = _build_embedding_provider()
+dream_proposer = _build_dream_proposer()
+store = MemoryStore(
+    settings.database_url,
+    embedding_provider=embedding_provider,
+    dream_proposer=dream_proposer,
+    dream_provider_name=settings.dream_provider,
+    dream_min_importance=settings.dream_min_importance,
+)
 
 OAUTH_PAGE_CSP = (
     "default-src 'none'; style-src 'unsafe-inline'; "
@@ -344,6 +393,16 @@ async def memory_status() -> dict:
     return await asyncio.to_thread(store.stats)
 
 
+@mcp.tool()
+async def memory_maintenance_status() -> dict:
+    """Inspect Nap, night-dream, vector, and patrol status when maintenance matters.
+
+    Do not call this during ordinary conversation. It is a read-only diagnostic
+    view: night-dream candidates remain pending and patrol never deletes memory.
+    """
+    return await asyncio.to_thread(store.maintenance_status)
+
+
 async def homepage(_: Request) -> HTMLResponse:
     path = Path(__file__).parent / "static" / "index.html"
     return HTMLResponse(path.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
@@ -366,6 +425,13 @@ async def health(_: Request) -> JSONResponse:
                 settings.mcp_auth_mode == "oauth" and settings.access_token and settings.public_base_url
             ),
             "timezone": settings.timezone,
+            "memory_maintenance": {
+                "embedding_provider": (
+                    embedding_provider.name if embedding_provider is not None else "disabled"
+                ),
+                "dream_provider": settings.dream_provider,
+                "dream_mode": settings.dream_mode,
+            },
         },
         headers={"Cache-Control": "no-store"},
         status_code=200 if database.get("connected") else 503,
@@ -487,28 +553,61 @@ async def import_archive(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"import failed: {str(exc)[:240]}"}, status_code=500)
 
 
+async def _maintenance_call(label: str, function, *args):
+    try:
+        return await asyncio.to_thread(function, *args)
+    except Exception:
+        log.exception("scheduled %s failed", label)
+        return None
+
+
 async def _maintenance_loop() -> None:
     last_pulse_key = ""
     last_night_key = ""
+    last_nap_at: datetime | None = None
     zone = ZoneInfo(settings.timezone)
     while True:
         try:
             now = datetime.now(zone)
+            if (
+                last_nap_at is None
+                or (now - last_nap_at).total_seconds() >= settings.nap_interval_minutes * 60
+            ):
+                nap_result = await _maintenance_call(
+                    "nap", partial(store.run_nap, limit=settings.nap_batch_size)
+                )
+                # During initial backfill, take another bounded batch next minute.
+                # Once caught up, return to the configured light maintenance interval.
+                if nap_result and (
+                    nap_result.get("status") == "warning"
+                    or not nap_result.get("remaining_total")
+                ):
+                    last_nap_at = now
             if now.hour in {9, 15, 21}:
                 key = now.strftime("%Y-%m-%d-%H")
                 if key != last_pulse_key:
-                    await asyncio.to_thread(store.refresh_pulse, settings.pulse_size)
+                    await _maintenance_call("pulse", store.refresh_pulse, settings.pulse_size)
                     last_pulse_key = key
-            if now.hour == 4:
+            if now.hour == settings.dream_hour:
                 key = now.strftime("%Y-%m-%d")
                 if key != last_night_key:
-                    await asyncio.to_thread(
+                    last_night_key = key
+                    if settings.dream_mode != "off":
+                        await _maintenance_call(
+                            "night dream",
+                            partial(store.run_dream, mode=settings.dream_mode),
+                        )
+                    await _maintenance_call(
+                        "cross-source relations",
                         store.build_cross_source_relations,
                         settings.relation_auto_threshold,
                         settings.relation_review_threshold,
                     )
-                    await asyncio.to_thread(store.refresh_pulse, settings.pulse_size)
-                    last_night_key = key
+                    await _maintenance_call(
+                        "night nap", partial(store.run_nap, limit=settings.nap_batch_size)
+                    )
+                    await _maintenance_call("patrol", store.run_patrol)
+                    await _maintenance_call("night pulse", store.refresh_pulse, settings.pulse_size)
         except Exception:
             log.exception("scheduled memory maintenance failed")
         await asyncio.sleep(60)

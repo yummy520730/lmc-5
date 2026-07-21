@@ -114,6 +114,81 @@ CREATE TABLE IF NOT EXISTS lmc5_raw_events (
 CREATE INDEX IF NOT EXISTS lmc5_events_created_idx ON lmc5_raw_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS lmc5_events_trgm_idx ON lmc5_raw_events USING GIN(content gin_trgm_ops);
 
+CREATE TABLE IF NOT EXISTS lmc5_embeddings (
+    memory_id BIGINT NOT NULL REFERENCES lmc5_curated_memories(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dimension INTEGER NOT NULL,
+    embedding DOUBLE PRECISION[] NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (memory_id, provider, model, dimension)
+);
+
+CREATE INDEX IF NOT EXISTS lmc5_embeddings_provider_idx
+    ON lmc5_embeddings(provider, model, dimension);
+
+CREATE TABLE IF NOT EXISTS lmc5_dream_runs (
+    id BIGSERIAL PRIMARY KEY,
+    mode TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    event_count INTEGER NOT NULL DEFAULT 0,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    applied_count INTEGER NOT NULL DEFAULT 0,
+    relation_count INTEGER NOT NULL DEFAULT 0,
+    report JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    CONSTRAINT lmc5_dream_mode_check CHECK (mode IN ('dry_run','apply')),
+    CONSTRAINT lmc5_dream_status_check CHECK (status IN ('running','ok','error'))
+);
+
+CREATE TABLE IF NOT EXISTS lmc5_dream_candidates (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT REFERENCES lmc5_dream_runs(id) ON DELETE SET NULL,
+    candidate_key TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    category TEXT NOT NULL,
+    thread TEXT NOT NULL,
+    importance REAL NOT NULL,
+    privacy_scope TEXT NOT NULL DEFAULT 'personal',
+    protected BOOLEAN NOT NULL DEFAULT FALSE,
+    evidence_event_ids BIGINT[] NOT NULL DEFAULT '{}',
+    relation_terms TEXT[] NOT NULL DEFAULT '{}',
+    proposer TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    applied_memory_id BIGINT REFERENCES lmc5_curated_memories(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ,
+    CONSTRAINT lmc5_dream_candidate_status_check
+        CHECK (status IN ('pending','applied','rejected','duplicate'))
+);
+
+CREATE INDEX IF NOT EXISTS lmc5_dream_candidates_status_idx
+    ON lmc5_dream_candidates(status, created_at DESC);
+
+ALTER TABLE lmc5_raw_events ADD COLUMN IF NOT EXISTS digested_at TIMESTAMPTZ;
+ALTER TABLE lmc5_raw_events ADD COLUMN IF NOT EXISTS dream_run_id BIGINT;
+
+CREATE TABLE IF NOT EXISTS lmc5_maintenance_runs (
+    id BIGSERIAL PRIMARY KEY,
+    task TEXT NOT NULL,
+    status TEXT NOT NULL,
+    dry_run BOOLEAN NOT NULL DEFAULT TRUE,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT lmc5_maintenance_task_check CHECK (task IN ('nap','dream','patrol')),
+    CONSTRAINT lmc5_maintenance_status_check CHECK (status IN ('ok','warning','error','skipped'))
+);
+
+CREATE INDEX IF NOT EXISTS lmc5_maintenance_runs_created_idx
+    ON lmc5_maintenance_runs(task, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS lmc5_perception_cache (
     memory_id BIGINT PRIMARY KEY REFERENCES lmc5_curated_memories(id) ON DELETE CASCADE,
     vitality REAL NOT NULL,

@@ -4,15 +4,16 @@ import hashlib
 import random
 import re
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from importlib.resources import files
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from .intelligence import DreamCandidate, EmbeddingProvider, cosine_similarity
 from .scoring import normalized_vitality, recall_score, recency_score, vitality
 
 
@@ -106,8 +107,20 @@ class StoreUnavailable(RuntimeError):
 
 
 class MemoryStore:
-    def __init__(self, database_url: str):
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
+        dream_proposer: Callable[[Sequence[dict[str, Any]]], list[DreamCandidate]] | None = None,
+        dream_provider_name: str = "local_evidence",
+        dream_min_importance: float = 7.0,
+    ):
         self.database_url = database_url
+        self.embedding_provider = embedding_provider
+        self.dream_proposer = dream_proposer
+        self.dream_provider_name = dream_provider_name
+        self.dream_min_importance = max(1.0, min(10.0, float(dream_min_importance)))
 
     @contextmanager
     def connect(self) -> Iterator[psycopg.Connection]:
@@ -301,6 +314,14 @@ class MemoryStore:
         patterns = [f"%{term}%" for term in expanded_terms]
         lexical_candidate_limit = max(limit * (10 if include_sensitive else 6), 80 if include_sensitive else 40)
         recent_candidate_limit = max(limit * (6 if include_sensitive else 4), 40 if include_sensitive else 24)
+        query_vector: list[float] | None = None
+        if self.embedding_provider is not None:
+            try:
+                query_vector = self.embedding_provider.embed(query, task="query")
+            except Exception:
+                # Semantic recall is an optional channel. Lexical/graph recall
+                # must remain available when an external embedding API fails.
+                query_vector = None
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -341,17 +362,60 @@ class MemoryStore:
                 ),
             ).fetchall()
 
+            semantic_scores: dict[int, float] = {}
+            semantic_rows: dict[int, dict[str, Any]] = {}
+            if query_vector is not None and self.embedding_provider is not None:
+                embedded = conn.execute(
+                    """
+                    SELECT m.*,e.embedding
+                    FROM lmc5_embeddings e
+                    JOIN lmc5_curated_memories m ON m.id=e.memory_id
+                    WHERE e.provider=%s AND e.model=%s AND e.dimension=%s
+                      AND m.version_status='current' AND m.privacy_scope = ANY(%s)
+                    """,
+                    (
+                        self.embedding_provider.name,
+                        self.embedding_provider.model,
+                        self.embedding_provider.dimension,
+                        privacy,
+                    ),
+                ).fetchall()
+                threshold = 0.08 if self.embedding_provider.name == "local_hash" else 0.25
+                ranked_semantic: list[tuple[float, dict[str, Any]]] = []
+                for embedded_row in embedded:
+                    item = dict(embedded_row)
+                    vector = item.pop("embedding", None) or []
+                    score = max(0.0, cosine_similarity(query_vector, vector))
+                    if score >= threshold:
+                        ranked_semantic.append((score, item))
+                ranked_semantic.sort(key=lambda pair: pair[0], reverse=True)
+                for score, item in ranked_semantic[: max(limit * 6, 30)]:
+                    memory_id = int(item["id"])
+                    semantic_scores[memory_id] = score
+                    semantic_rows[memory_id] = item
+
+            combined_rows: dict[int, dict[str, Any]] = {
+                int(row["id"]): dict(row) for row in rows
+            }
+            for memory_id, item in semantic_rows.items():
+                combined_rows.setdefault(memory_id, item)
+
             scored: list[tuple[float, dict[str, Any]]] = []
-            for row in rows:
+            for memory_id, row in combined_rows.items():
                 item = dict(row)
                 live = vitality(item)
                 term_hits = int(item.pop("term_hits", 0) or 0)
                 lexical = max(
                     0.0,
-                    float(item.pop("lexical_score") or 0),
+                    float(item.pop("lexical_score", 0) or 0),
                     _query_coverage(item, concepts),
                 )
-                final, breakdown = recall_score(item, lexical)
+                semantic = semantic_scores.get(memory_id, 0.0)
+                relevance = max(lexical, semantic)
+                final, breakdown = recall_score(item, relevance)
+                breakdown["lexical"] = round(lexical, 4)
+                breakdown["semantic"] = round(semantic, 4)
+                breakdown["relevance_fusion"] = round(relevance, 4)
                 explicit_sensitive_match = bool(
                     include_sensitive
                     and item.get("privacy_scope") == "sensitive"
@@ -365,6 +429,8 @@ class MemoryStore:
                 item["score_breakdown"] = breakdown
                 item["vitality"] = live
                 item["channels"] = ["lexical", "entity_terms", "vitality", "recency"]
+                if semantic:
+                    item["channels"].insert(1, "semantic_vector")
                 if explicit_sensitive_match:
                     item["channels"].insert(2, "explicit_sensitive")
                 scored.append((final, item))
@@ -585,6 +651,519 @@ class MemoryStore:
             {**self._public_memory(dict(row)), "selected_via": row["selected_via"]}
             for row in rows
         ]
+
+    @staticmethod
+    def _embedding_text(memory: dict[str, Any]) -> str:
+        tags = " ".join(str(tag) for tag in memory.get("tags") or [])
+        return (
+            f"{memory.get('title') or ''}\n{memory.get('content') or ''}\n{tags}"
+        ).strip()
+
+    @staticmethod
+    def _embedding_content_hash(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _record_maintenance(
+        self,
+        task: str,
+        status: str,
+        *,
+        dry_run: bool,
+        details: dict[str, Any],
+        error: str = "",
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO lmc5_maintenance_runs(task,status,dry_run,details,error)
+                VALUES (%s,%s,%s,%s,%s)
+                """,
+                (task, status, dry_run, Jsonb(details), error[:1000]),
+            )
+
+    def run_nap(self, *, limit: int = 40, neighbor_top_k: int = 2) -> dict[str, Any]:
+        """Backfill portable embeddings and connect orphan current memories.
+
+        This pass never creates or deletes memory content. Relation writes are
+        limited to safe `same_topic` edges and require a positive vector match.
+        """
+        provider = self.embedding_provider
+        if provider is None:
+            result = {
+                "status": "skipped",
+                "reason": "embedding provider is disabled",
+                "vectors_written": 0,
+                "relations_written": 0,
+            }
+            self._record_maintenance("nap", "skipped", dry_run=False, details=result)
+            return result
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.*,e.content_hash AS embedding_content_hash
+                FROM lmc5_curated_memories m
+                LEFT JOIN lmc5_embeddings e
+                  ON e.memory_id=m.id AND e.provider=%s AND e.model=%s AND e.dimension=%s
+                WHERE m.version_status='current'
+                ORDER BY m.updated_at DESC,m.id DESC
+                """,
+                (provider.name, provider.model, provider.dimension),
+            ).fetchall()
+
+        pending_all: list[tuple[dict[str, Any], str, str]] = []
+        for row in rows:
+            item = dict(row)
+            previous_hash = str(item.pop("embedding_content_hash", "") or "")
+            text = self._embedding_text(item)
+            content_hash = self._embedding_content_hash(text)
+            if content_hash != previous_hash:
+                pending_all.append((item, text, content_hash))
+        pending = pending_all[: max(1, limit)]
+
+        vectors_written = 0
+        errors: list[str] = []
+        generated: list[tuple[int, list[float], str]] = []
+        for item, text, content_hash in pending:
+            try:
+                vector = provider.embed(text, task="document")
+                if len(vector) != provider.dimension:
+                    raise ValueError(
+                        f"expected {provider.dimension} dimensions, got {len(vector)}"
+                    )
+                generated.append((int(item["id"]), vector, content_hash))
+            except Exception as exc:
+                errors.append(f"memory {item.get('id')}: {type(exc).__name__}: {exc}")
+                if provider.name != "local_hash":
+                    # Avoid hammering an unavailable paid/external API.
+                    break
+
+        if generated:
+            with self.connect() as conn:
+                for memory_id, vector, content_hash in generated:
+                    conn.execute(
+                        """
+                        INSERT INTO lmc5_embeddings(
+                          memory_id,provider,model,dimension,embedding,content_hash
+                        ) VALUES (%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (memory_id,provider,model,dimension) DO UPDATE SET
+                          embedding=EXCLUDED.embedding,content_hash=EXCLUDED.content_hash,
+                          updated_at=NOW()
+                        """,
+                        (
+                            memory_id,
+                            provider.name,
+                            provider.model,
+                            provider.dimension,
+                            vector,
+                            content_hash,
+                        ),
+                    )
+                    vectors_written += 1
+
+        relations_written = 0
+        with self.connect() as conn:
+            embedded = conn.execute(
+                """
+                SELECT m.id,m.privacy_scope,e.embedding
+                FROM lmc5_curated_memories m
+                JOIN lmc5_embeddings e ON e.memory_id=m.id
+                WHERE m.version_status='current'
+                  AND e.provider=%s AND e.model=%s AND e.dimension=%s
+                """,
+                (provider.name, provider.model, provider.dimension),
+            ).fetchall()
+            orphan_rows = conn.execute(
+                """
+                SELECT m.id,m.privacy_scope
+                FROM lmc5_curated_memories m
+                WHERE m.version_status='current'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM lmc5_memory_relations r
+                    WHERE r.status='current' AND r.valid_until IS NULL
+                      AND (r.source_id=m.id OR r.target_id=m.id)
+                  )
+                ORDER BY m.created_at DESC,m.id DESC LIMIT %s
+                """,
+                (max(1, limit),),
+            ).fetchall()
+            vectors = {int(row["id"]): list(row["embedding"] or []) for row in embedded}
+            privacy_by_id = {int(row["id"]): str(row["privacy_scope"]) for row in embedded}
+            for orphan in orphan_rows:
+                source_id = int(orphan["id"])
+                source_vector = vectors.get(source_id)
+                if not source_vector:
+                    continue
+                candidates: list[tuple[float, int]] = []
+                for target_id, target_vector in vectors.items():
+                    if target_id == source_id:
+                        continue
+                    # Do not create a hidden bridge from a sensitive memory into
+                    # ordinary spontaneous-recall material.
+                    if privacy_by_id.get(target_id) != privacy_by_id.get(source_id):
+                        continue
+                    score = max(0.0, cosine_similarity(source_vector, target_vector))
+                    if score >= (0.18 if provider.name == "local_hash" else 0.55):
+                        candidates.append((score, target_id))
+                candidates.sort(reverse=True)
+                for score, target_id in candidates[: max(1, neighbor_top_k)]:
+                    a, b = sorted((source_id, target_id))
+                    inserted = conn.execute(
+                        """
+                        INSERT INTO lmc5_memory_relations(
+                          source_id,target_id,relation_type,strength,reason,status
+                        ) VALUES (%s,%s,'same_topic',%s,%s,'current')
+                        ON CONFLICT (source_id,target_id,relation_type) DO NOTHING
+                        RETURNING id
+                        """,
+                        (
+                            a,
+                            b,
+                            min(0.75, max(0.40, score)),
+                            f"nap:{provider.name}:{provider.model}",
+                        ),
+                    ).fetchone()
+                    relations_written += int(bool(inserted))
+
+        remaining = max(0, len(pending_all) - vectors_written)
+        result = {
+            "status": "warning" if errors else "ok",
+            "provider": provider.name,
+            "model": provider.model,
+            "dimension": provider.dimension,
+            "scanned": len(rows),
+            "pending_total": len(pending_all),
+            "pending_selected": len(pending),
+            "vectors_written": vectors_written,
+            "relations_written": relations_written,
+            "remaining_total": remaining,
+            "errors": errors[:5],
+        }
+        self._record_maintenance(
+            "nap", result["status"], dry_run=False, details=result, error="; ".join(errors[:2])
+        )
+        return result
+
+    def run_patrol(self) -> dict[str, Any]:
+        """Run a read-only structural health patrol and store its report."""
+        provider = self.embedding_provider
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  count(*) FILTER (WHERE version_status='current') AS current_memories,
+                  count(*) FILTER (WHERE version_status='review') AS memory_review,
+                  count(*) FILTER (WHERE version_status='archived') AS archived_memories,
+                  (SELECT count(*) FROM lmc5_raw_events WHERE digested_at IS NULL) AS raw_backlog,
+                  (SELECT count(*) FROM lmc5_dream_candidates WHERE status='pending') AS dream_pending,
+                  (SELECT count(*) FROM lmc5_memory_relations WHERE status='review') AS relation_review,
+                  (SELECT count(*) FROM lmc5_z_audit WHERE status='pending') AS z_pending
+                FROM lmc5_curated_memories
+                """
+            ).fetchone()
+            orphan_memories = conn.execute(
+                """
+                SELECT count(*) AS count FROM lmc5_curated_memories m
+                WHERE m.version_status='current' AND NOT EXISTS (
+                  SELECT 1 FROM lmc5_memory_relations r
+                  WHERE r.status='current' AND r.valid_until IS NULL
+                    AND (r.source_id=m.id OR r.target_id=m.id)
+                )
+                """
+            ).fetchone()["count"]
+            duplicate_groups = conn.execute(
+                """
+                SELECT count(*) AS count FROM (
+                  SELECT lower(title),content,count(*)
+                  FROM lmc5_curated_memories WHERE version_status='current'
+                  GROUP BY lower(title),content HAVING count(*)>1
+                ) duplicates
+                """
+            ).fetchone()["count"]
+            embedding_count = 0
+            if provider is not None:
+                embedding_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS count FROM lmc5_embeddings
+                        WHERE provider=%s AND model=%s AND dimension=%s
+                        """,
+                        (provider.name, provider.model, provider.dimension),
+                    ).fetchone()["count"]
+                )
+
+        snapshot = dict(row)
+        current = int(snapshot.get("current_memories") or 0)
+        findings: list[dict[str, Any]] = []
+        missing_vectors = max(0, current - embedding_count) if provider is not None else current
+        if missing_vectors:
+            findings.append(
+                {"check": "missing_vectors", "severity": "warning", "count": missing_vectors}
+            )
+        if int(orphan_memories or 0):
+            findings.append(
+                {"check": "orphan_memories", "severity": "info", "count": int(orphan_memories)}
+            )
+        if int(duplicate_groups or 0):
+            findings.append(
+                {"check": "duplicate_groups", "severity": "warning", "count": int(duplicate_groups)}
+            )
+        if int(snapshot.get("z_pending") or 0):
+            findings.append(
+                {"check": "z_pending", "severity": "review", "count": int(snapshot["z_pending"])}
+            )
+        result = {
+            "status": "warning" if findings else "ok",
+            "read_only": True,
+            "snapshot": {
+                **snapshot,
+                "active_embeddings": embedding_count,
+                "missing_vectors": missing_vectors,
+                "orphan_memories": int(orphan_memories or 0),
+                "duplicate_groups": int(duplicate_groups or 0),
+            },
+            "findings": findings,
+            "automatic_deletions": 0,
+        }
+        self._record_maintenance("patrol", result["status"], dry_run=True, details=result)
+        return result
+
+    def run_dream(self, *, mode: str = "dry_run", event_limit: int = 200) -> dict[str, Any]:
+        """Turn undigested raw events into reviewable candidates.
+
+        `dry_run` stores candidates for inspection but never changes curated
+        memory or marks source events digested. `apply` is available only as an
+        explicit environment-level opt-in and still applies importance and
+        duplicate gates.
+        """
+        if mode not in {"dry_run", "apply"}:
+            raise ValueError("dream mode must be dry_run or apply")
+        if self.dream_proposer is None:
+            result = {"status": "skipped", "reason": "dream proposer is disabled"}
+            self._record_maintenance("dream", "skipped", dry_run=True, details=result)
+            return result
+
+        with self.connect() as conn:
+            run_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO lmc5_dream_runs(mode,provider,status)
+                    VALUES (%s,%s,'running') RETURNING id
+                    """,
+                    (mode, self.dream_provider_name),
+                ).fetchone()["id"]
+            )
+            events = conn.execute(
+                """
+                SELECT id,session_id,role,channel,content,metadata,created_at
+                FROM lmc5_raw_events
+                WHERE digested_at IS NULL
+                  AND created_at < NOW() - INTERVAL '10 minutes'
+                ORDER BY created_at ASC,id ASC LIMIT %s
+                """,
+                (max(1, event_limit),),
+            ).fetchall()
+
+        try:
+            candidates = self.dream_proposer([dict(row) for row in events])
+            applied = duplicates = 0
+            applied_ids: list[int] = []
+            with self.connect() as conn:
+                for candidate in candidates:
+                    category = candidate.category if candidate.category in ALLOWED_CATEGORIES else "episode"
+                    privacy_scope = (
+                        candidate.privacy_scope
+                        if candidate.privacy_scope in {"personal", "sensitive", "public"}
+                        else "personal"
+                    )
+                    candidate_row = conn.execute(
+                        """
+                        INSERT INTO lmc5_dream_candidates(
+                          run_id,candidate_key,title,content,category,thread,importance,
+                          privacy_scope,protected,evidence_event_ids,relation_terms,proposer,status
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
+                        ON CONFLICT (candidate_key) DO UPDATE SET run_id=EXCLUDED.run_id
+                        RETURNING id,status
+                        """,
+                        (
+                            run_id,
+                            candidate.candidate_key,
+                            candidate.title,
+                            candidate.content,
+                            category,
+                            candidate.thread,
+                            candidate.importance,
+                            privacy_scope,
+                            bool(candidate.protected and privacy_scope != "sensitive"),
+                            list(candidate.evidence_event_ids),
+                            list(candidate.relation_terms),
+                            candidate.proposer,
+                        ),
+                    ).fetchone()
+                    if mode != "apply" or candidate.importance < self.dream_min_importance:
+                        continue
+                    if candidate_row["status"] == "applied":
+                        continue
+                    duplicate = conn.execute(
+                        """
+                        SELECT id FROM lmc5_curated_memories
+                        WHERE version_status='current' AND (
+                          lower(title)=lower(%s) OR
+                          similarity(COALESCE(title,'') || ' ' || content,%s) > 0.78
+                        ) ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (candidate.title, f"{candidate.title} {candidate.content}"),
+                    ).fetchone()
+                    if duplicate:
+                        conn.execute(
+                            """
+                            UPDATE lmc5_dream_candidates
+                            SET status='duplicate',reviewed_at=NOW(),applied_memory_id=%s
+                            WHERE id=%s
+                            """,
+                            (int(duplicate["id"]), int(candidate_row["id"])),
+                        )
+                        duplicates += 1
+                        continue
+                    memory_id, _ = self._upsert_memory(
+                        conn,
+                        {
+                            "source": f"night_dream:{candidate.proposer}",
+                            "category": category,
+                            "title": candidate.title,
+                            "content": candidate.content,
+                            "thread": candidate.thread,
+                            "tags": ["night_dream", *candidate.relation_terms],
+                            "weight": round(candidate.importance / 3.3, 3),
+                            "original_importance": candidate.importance,
+                            "protected": bool(candidate.protected and privacy_scope != "sensitive"),
+                            "privacy_scope": privacy_scope,
+                            "surface_allowed": (
+                                privacy_scope in {"personal", "public"}
+                                and category not in {
+                                    "health", "legal", "knowledge", "tasks", "conversation"
+                                }
+                            ),
+                            "confidence": 0.78 if candidate.proposer == "gemini" else 0.62,
+                        },
+                    )
+                    conn.execute(
+                        """
+                        UPDATE lmc5_dream_candidates
+                        SET status='applied',reviewed_at=NOW(),applied_memory_id=%s
+                        WHERE id=%s
+                        """,
+                        (memory_id, int(candidate_row["id"])),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE lmc5_raw_events SET digested_at=NOW(),dream_run_id=%s
+                        WHERE id=ANY(%s)
+                        """,
+                        (run_id, list(candidate.evidence_event_ids)),
+                    )
+                    applied += 1
+                    applied_ids.append(memory_id)
+
+                report = {
+                    "event_count": len(events),
+                    "candidate_count": len(candidates),
+                    "applied_count": applied,
+                    "duplicate_count": duplicates,
+                    "applied_memory_ids": applied_ids,
+                    "mode": mode,
+                    "provider": self.dream_provider_name,
+                    "minimum_importance": self.dream_min_importance,
+                }
+                conn.execute(
+                    """
+                    UPDATE lmc5_dream_runs SET status='ok',event_count=%s,candidate_count=%s,
+                      applied_count=%s,report=%s,finished_at=NOW() WHERE id=%s
+                    """,
+                    (len(events), len(candidates), applied, Jsonb(report), run_id),
+                )
+            result = {"status": "ok", "run_id": run_id, **report}
+            self._record_maintenance(
+                "dream", "ok", dry_run=mode == "dry_run", details=result
+            )
+            return result
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE lmc5_dream_runs SET status='error',error=%s,finished_at=NOW()
+                    WHERE id=%s
+                    """,
+                    (error[:1000], run_id),
+                )
+            self._record_maintenance(
+                "dream", "error", dry_run=mode == "dry_run", details={"run_id": run_id}, error=error
+            )
+            return {"status": "error", "run_id": run_id, "error": error}
+
+    def maintenance_status(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            runs = conn.execute(
+                """
+                SELECT DISTINCT ON (task) task,status,dry_run,details,error,created_at
+                FROM lmc5_maintenance_runs ORDER BY task,created_at DESC
+                """
+            ).fetchall()
+            dream_counts = conn.execute(
+                """
+                SELECT status,count(*) AS count FROM lmc5_dream_candidates
+                GROUP BY status ORDER BY status
+                """
+            ).fetchall()
+            total_embedding_count = int(
+                conn.execute("SELECT count(*) AS count FROM lmc5_embeddings").fetchone()["count"]
+            )
+            active_embedding_count = 0
+            if self.embedding_provider is not None:
+                active_embedding_count = int(
+                    conn.execute(
+                        """
+                        SELECT count(*) AS count FROM lmc5_embeddings
+                        WHERE provider=%s AND model=%s AND dimension=%s
+                        """,
+                        (
+                            self.embedding_provider.name,
+                            self.embedding_provider.model,
+                            self.embedding_provider.dimension,
+                        ),
+                    ).fetchone()["count"]
+                )
+            pending_candidates = conn.execute(
+                """
+                SELECT id,title,category,thread,importance,privacy_scope,protected,
+                  evidence_event_ids,relation_terms,proposer,created_at
+                FROM lmc5_dream_candidates WHERE status='pending'
+                ORDER BY importance DESC,created_at DESC LIMIT 10
+                """
+            ).fetchall()
+        return {
+            "embedding_provider": (
+                {
+                    "name": self.embedding_provider.name,
+                    "model": self.embedding_provider.model,
+                    "dimension": self.embedding_provider.dimension,
+                }
+                if self.embedding_provider is not None
+                else None
+            ),
+            "embeddings": {
+                "active": active_embedding_count,
+                "all_providers": total_embedding_count,
+            },
+            "dream_provider": self.dream_provider_name,
+            "dream_min_importance": self.dream_min_importance,
+            "dream_candidates": [dict(row) for row in dream_counts],
+            "pending_candidate_preview": [
+                self._dashboard_row(dict(row)) for row in pending_candidates
+            ],
+            "latest_runs": [self._dashboard_row(dict(row)) for row in runs],
+        }
 
     def import_records(
         self,

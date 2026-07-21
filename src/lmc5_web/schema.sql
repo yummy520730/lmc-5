@@ -102,17 +102,35 @@ CREATE INDEX IF NOT EXISTS lmc5_relations_target_idx ON lmc5_memory_relations(ta
 CREATE TABLE IF NOT EXISTS lmc5_raw_events (
     id BIGSERIAL PRIMARY KEY,
     session_id TEXT NOT NULL DEFAULT '',
+    external_id TEXT,
+    turn_index INTEGER,
+    parent_external_id TEXT,
     role TEXT NOT NULL,
     channel TEXT NOT NULL DEFAULT 'claude_web',
     content TEXT NOT NULL,
     content_hash TEXT NOT NULL,
+    privacy_scope TEXT NOT NULL DEFAULT 'personal',
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (session_id, role, content_hash)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS lmc5_events_created_idx ON lmc5_raw_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS lmc5_events_trgm_idx ON lmc5_raw_events USING GIN(content gin_trgm_ops);
+ALTER TABLE lmc5_raw_events ADD COLUMN IF NOT EXISTS external_id TEXT;
+ALTER TABLE lmc5_raw_events ADD COLUMN IF NOT EXISTS turn_index INTEGER;
+ALTER TABLE lmc5_raw_events ADD COLUMN IF NOT EXISTS parent_external_id TEXT;
+ALTER TABLE lmc5_raw_events
+    ADD COLUMN IF NOT EXISTS privacy_scope TEXT NOT NULL DEFAULT 'personal';
+ALTER TABLE lmc5_raw_events
+    DROP CONSTRAINT IF EXISTS lmc5_raw_events_session_id_role_content_hash_key;
+CREATE UNIQUE INDEX IF NOT EXISTS lmc5_events_runtime_dedupe_idx
+    ON lmc5_raw_events(session_id, role, content_hash) WHERE external_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS lmc5_events_external_id_idx
+    ON lmc5_raw_events(channel, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS lmc5_events_session_turn_idx
+    ON lmc5_raw_events(channel, session_id, turn_index);
+CREATE INDEX IF NOT EXISTS lmc5_events_privacy_idx
+    ON lmc5_raw_events(privacy_scope);
 
 CREATE TABLE IF NOT EXISTS lmc5_embeddings (
     memory_id BIGINT NOT NULL REFERENCES lmc5_curated_memories(id) ON DELETE CASCADE,
@@ -189,6 +207,20 @@ CREATE TABLE IF NOT EXISTS lmc5_maintenance_runs (
 CREATE INDEX IF NOT EXISTS lmc5_maintenance_runs_created_idx
     ON lmc5_maintenance_runs(task, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS lmc5_dashboard_audit (
+    id BIGSERIAL PRIMARY KEY,
+    memory_id BIGINT REFERENCES lmc5_curated_memories(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    before_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    after_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT lmc5_dashboard_audit_action_check
+        CHECK (action IN ('update_weight','archive','restore'))
+);
+
+CREATE INDEX IF NOT EXISTS lmc5_dashboard_audit_memory_idx
+    ON lmc5_dashboard_audit(memory_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS lmc5_perception_cache (
     memory_id BIGINT PRIMARY KEY REFERENCES lmc5_curated_memories(id) ON DELETE CASCADE,
     vitality REAL NOT NULL,
@@ -216,11 +248,14 @@ CREATE TABLE IF NOT EXISTS lmc5_import_runs (
     dry_run BOOLEAN NOT NULL,
     file_count INTEGER NOT NULL,
     memory_count INTEGER NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
     created_count INTEGER NOT NULL DEFAULT 0,
     reused_count INTEGER NOT NULL DEFAULT 0,
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE lmc5_import_runs ADD COLUMN IF NOT EXISTS event_count INTEGER NOT NULL DEFAULT 0;
 
 DO $$
 BEGIN

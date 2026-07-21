@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import zipfile
 from collections import Counter
@@ -14,7 +15,7 @@ import yaml
 
 
 MAX_ARCHIVE_ENTRIES = 3000
-MAX_UNCOMPRESSED_BYTES = 75 * 1024 * 1024
+MAX_UNCOMPRESSED_BYTES = 150 * 1024 * 1024
 SKIP_NAMES = {".env", ".dashboard_auth.json", "credentials.json", "secrets.json"}
 
 
@@ -84,7 +85,7 @@ _SECRET_PATTERNS = (
 )
 _SENSITIVE_WORDS = (
     "健康", "经期", "药物", "医院", "诊断", "创伤", "性侵", "家暴", "法律",
-    "离婚协议", "身份证", "住址", "银行卡", "病史", "身体数据",
+    "离婚", "离婚协议", "身份证", "住址", "银行卡", "病史", "身体数据",
 )
 
 
@@ -161,6 +162,174 @@ def parse_ombre_archive(archive: bytes, timezone_name: str = "Asia/Shanghai") ->
             }
         )
     return _result("ombre_brain", archive, documents, memories, skipped)
+
+
+def _claude_visible_text(message: dict[str, Any]) -> tuple[str, int, int]:
+    """Return only chat-visible text, never thinking or tool payloads.
+
+    Current Claude exports keep hidden thinking and tool traffic beside visible
+    text in ``content`` and may also fold them into the legacy ``text`` field.
+    Reading only explicit text blocks prevents chain-of-thought and connector
+    payloads from entering the raw journal.
+    """
+    content = message.get("content")
+    if isinstance(content, list):
+        visible: list[str] = []
+        thinking_blocks = 0
+        tool_blocks = 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "")
+            if block_type == "text":
+                text = str(block.get("text") or "").strip()
+                if text:
+                    visible.append(text)
+            elif block_type == "thinking":
+                thinking_blocks += 1
+            elif block_type in {"tool_use", "tool_result"}:
+                tool_blocks += 1
+        return "\n\n".join(visible).strip(), thinking_blocks, tool_blocks
+
+    # Older human-message exports may not contain structured content. Assistant
+    # fallback is intentionally disabled because its legacy text can include
+    # hidden reasoning or tool traces.
+    if str(message.get("sender") or "").lower() in {"human", "user"}:
+        return str(message.get("text") or "").strip(), 0, 0
+    return "", 0, 0
+
+
+def parse_claude_archive(
+    archive: bytes,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Any]:
+    """Parse a Claude account export into ordered, idempotent raw events."""
+    members, skipped_files = _safe_members(archive)
+    raw_conversations = next(
+        (raw for filename, raw in members if PurePosixPath(filename).name == "conversations.json"),
+        None,
+    )
+    if raw_conversations is None:
+        raise ValueError("Claude export is missing conversations.json")
+    try:
+        conversations = json.loads(_decode(raw_conversations))
+    except json.JSONDecodeError as exc:
+        raise ValueError("conversations.json is not valid JSON") from exc
+    if not isinstance(conversations, list):
+        raise ValueError("conversations.json must contain a list")
+
+    events: list[dict[str, Any]] = []
+    privacy_counts: Counter[str] = Counter()
+    role_counts: Counter[str] = Counter()
+    seen_message_ids: set[str] = set()
+    skipped_empty = 0
+    skipped_malformed = 0
+    skipped_secret = 0
+    excluded_thinking_blocks = 0
+    excluded_tool_blocks = 0
+    attachments_referenced = 0
+    files_referenced = 0
+    timestamps: list[datetime] = []
+
+    for conversation in conversations:
+        if not isinstance(conversation, dict):
+            skipped_malformed += 1
+            continue
+        session_id = str(conversation.get("uuid") or "").strip()
+        messages = conversation.get("chat_messages")
+        if not session_id or not isinstance(messages, list):
+            skipped_malformed += 1
+            continue
+        conversation_title = str(conversation.get("name") or "未命名会话").strip()[:500]
+        for turn_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                skipped_malformed += 1
+                continue
+            external_id = str(message.get("uuid") or "").strip()
+            sender = str(message.get("sender") or "").strip().lower()
+            role = {"human": "user", "user": "user", "assistant": "assistant"}.get(sender)
+            if not external_id or role is None or external_id in seen_message_ids:
+                skipped_malformed += 1
+                continue
+            seen_message_ids.add(external_id)
+            content, thinking_count, tool_count = _claude_visible_text(message)
+            excluded_thinking_blocks += thinking_count
+            excluded_tool_blocks += tool_count
+            if not content:
+                skipped_empty += 1
+                continue
+            privacy_scope, _ = _privacy(content, "conversation")
+            if privacy_scope == "secret":
+                # Passwords and API/database credentials are not useful memory
+                # evidence and should not be copied into a second database.
+                skipped_secret += 1
+                continue
+            created_at = _as_datetime(message.get("created_at"), timezone_name)
+            updated_at = _as_datetime(message.get("updated_at"), timezone_name)
+            if created_at:
+                timestamps.append(created_at)
+            attachments = message.get("attachments") or []
+            files = message.get("files") or []
+            attachments_referenced += len(attachments) if isinstance(attachments, list) else 0
+            files_referenced += len(files) if isinstance(files, list) else 0
+            privacy_counts[privacy_scope] += 1
+            role_counts[role] += 1
+            events.append(
+                {
+                    "external_id": external_id,
+                    "session_id": session_id,
+                    "turn_index": turn_index,
+                    "parent_external_id": str(message.get("parent_message_uuid") or "").strip() or None,
+                    "role": role,
+                    "channel": "claude_export",
+                    "content": content,
+                    "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "privacy_scope": privacy_scope,
+                    "created_at": created_at,
+                    "metadata": {
+                        "source": "claude_data_export",
+                        "conversation_title": conversation_title,
+                        "conversation_created_at": conversation.get("created_at"),
+                        "conversation_updated_at": conversation.get("updated_at"),
+                        "message_updated_at": updated_at.isoformat() if updated_at else None,
+                        "attachment_count": len(attachments) if isinstance(attachments, list) else 0,
+                        "file_count": len(files) if isinstance(files, list) else 0,
+                        "visible_text_only": True,
+                    },
+                }
+            )
+
+    events.sort(
+        key=lambda item: (
+            item["session_id"],
+            int(item["turn_index"]),
+            item["created_at"] or datetime.min.replace(tzinfo=ZoneInfo(timezone_name)),
+        )
+    )
+    return {
+        "source_type": "claude_export",
+        "archive_sha256": hashlib.sha256(archive).hexdigest(),
+        "events": events,
+        "preview": {
+            "source_type": "claude_export",
+            "conversations": len(conversations),
+            "events": len(events),
+            "roles": dict(sorted(role_counts.items())),
+            "privacy": dict(sorted(privacy_counts.items())),
+            "time_range": {
+                "first": min(timestamps).isoformat() if timestamps else None,
+                "last": max(timestamps).isoformat() if timestamps else None,
+            },
+            "skipped_empty_or_tool_only_messages": skipped_empty,
+            "skipped_malformed_or_duplicate_messages": skipped_malformed,
+            "skipped_credential_messages": skipped_secret,
+            "excluded_thinking_blocks": excluded_thinking_blocks,
+            "excluded_tool_blocks": excluded_tool_blocks,
+            "attachments_referenced": attachments_referenced,
+            "files_referenced": files_referenced,
+            "skipped_credential_or_hidden_files": skipped_files,
+        },
+    }
 
 
 def _document_date(text: str, filename: str, timezone_name: str) -> datetime | None:

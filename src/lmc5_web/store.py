@@ -115,12 +115,14 @@ class MemoryStore:
         dream_proposer: Callable[[Sequence[dict[str, Any]]], list[DreamCandidate]] | None = None,
         dream_provider_name: str = "local_evidence",
         dream_min_importance: float = 7.0,
+        nap_relation_threshold: float = 0.24,
     ):
         self.database_url = database_url
         self.embedding_provider = embedding_provider
         self.dream_proposer = dream_proposer
         self.dream_provider_name = dream_provider_name
         self.dream_min_importance = max(1.0, min(10.0, float(dream_min_importance)))
+        self.nap_relation_threshold = max(0.10, min(0.95, float(nap_relation_threshold)))
 
     @contextmanager
     def connect(self) -> Iterator[psycopg.Connection]:
@@ -297,7 +299,7 @@ class MemoryStore:
                 """
                 INSERT INTO lmc5_raw_events(session_id, role, channel, content, content_hash, metadata)
                 VALUES (%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (session_id, role, content_hash) DO NOTHING
+                ON CONFLICT DO NOTHING
                 RETURNING id
                 """,
                 (session_id or "", role, channel, clean_content, content_hash, Jsonb(metadata or {})),
@@ -528,6 +530,324 @@ class MemoryStore:
                 )
         return [self._public_memory(item) for item in selected]
 
+    def recall_layered(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        include_sensitive: bool = False,
+        source_budget_chars: int = 1200,
+        raw_budget_chars: int = 3200,
+        fallback_budget_chars: int = 1200,
+    ) -> dict[str, Any]:
+        """Return four evidence roles while preserving the legacy flat list."""
+        recalled = self.recall(query, limit=limit, include_sensitive=include_sensitive)
+        graph_expansion: list[dict[str, Any]] = []
+        main_recall: list[dict[str, Any]] = []
+        for item in recalled:
+            graph_channel = next(
+                (
+                    channel
+                    for channel in item.get("channels") or []
+                    if str(channel).startswith("graph:")
+                ),
+                "",
+            )
+            layered_item = dict(item)
+            if graph_channel:
+                layered_item["evidence_role"] = "association"
+                layered_item["relation_explanation"] = graph_channel.removeprefix("graph:")
+                graph_expansion.append(layered_item)
+            else:
+                layered_item["evidence_role"] = "authority"
+                main_recall.append(layered_item)
+
+        source_neighborhood = self._source_neighborhood(
+            [int(item["id"]) for item in recalled],
+            include_sensitive=include_sensitive,
+            budget_chars=source_budget_chars,
+        )
+        raw_event_context = self._raw_event_context(
+            query,
+            include_sensitive=include_sensitive,
+            budget_chars=raw_budget_chars,
+            evidence_role=(
+                "original_context" if main_recall or source_neighborhood or graph_expansion
+                else "raw_event_fallback"
+            ),
+        )
+        fallback_archive: list[dict[str, Any]] = []
+        if (
+            not main_recall
+            and not source_neighborhood
+            and not graph_expansion
+            and not raw_event_context
+        ):
+            fallback_archive = self._archived_fallback(
+                query,
+                include_sensitive=include_sensitive,
+                limit=max(1, min(3, limit)),
+                budget_chars=fallback_budget_chars,
+            )
+
+        return {
+            "flat": recalled or fallback_archive,
+            "main_recall": main_recall,
+            "source_neighborhood": source_neighborhood,
+            "raw_event_context": raw_event_context,
+            "graph_expansion": graph_expansion,
+            "fallback_archive": fallback_archive,
+            "layer_contract": {
+                "main_recall": "current curated authority",
+                "source_neighborhood": "same-source navigation, not an independent fact",
+                "raw_event_context": (
+                    "candidate original conversation evidence with adjacent turns; "
+                    "not a curated fact or guaranteed provenance"
+                ),
+                "graph_expansion": "reviewed association, not primary evidence",
+                "fallback_archive": "historical fallback only; verify against the present",
+            },
+        }
+
+    def _raw_event_context(
+        self,
+        query: str,
+        *,
+        include_sensitive: bool,
+        budget_chars: int,
+        evidence_role: str,
+    ) -> list[dict[str, Any]]:
+        """Find one strong raw match and return its ordered conversation neighborhood."""
+        if budget_chars <= 0:
+            return []
+        concepts = _query_concepts(query)
+        terms = list(dict.fromkeys(term for group in concepts for term in group))
+        if not terms:
+            return []
+        patterns = [f"%{term}%" for term in terms]
+        privacy = ["personal", "public", "sensitive"] if include_sensitive else [
+            "personal",
+            "public",
+        ]
+        with self.connect() as conn:
+            anchors = conn.execute(
+                """
+                SELECT e.*,
+                  similarity(e.content,%s) AS raw_score,
+                  (SELECT count(*) FROM unnest(%s::text[]) AS term
+                   WHERE e.content ILIKE '%%' || term || '%%') AS term_hits
+                FROM lmc5_raw_events e
+                WHERE e.channel='claude_export'
+                  AND e.external_id IS NOT NULL
+                  AND e.turn_index IS NOT NULL
+                  AND e.privacy_scope=ANY(%s::text[])
+                  AND (
+                    e.content ILIKE ANY(%s::text[])
+                    OR similarity(e.content,%s)>0.18
+                  )
+                ORDER BY term_hits DESC,raw_score DESC,e.created_at DESC
+                LIMIT 6
+                """,
+                (query, terms, privacy, patterns, query),
+            ).fetchall()
+            if not anchors:
+                return []
+            # Multiple snippets from one conversation often match the same query.
+            # A single best anchor keeps the MCP payload small and auditable.
+            anchor = dict(anchors[0])
+            neighborhood = conn.execute(
+                """
+                SELECT * FROM (
+                  SELECT *,abs(turn_index-%s) AS turn_distance
+                  FROM lmc5_raw_events
+                  WHERE channel='claude_export' AND session_id=%s
+                    AND turn_index IS NOT NULL
+                    AND privacy_scope=ANY(%s::text[])
+                  ORDER BY turn_distance ASC,turn_index ASC
+                  LIMIT 5
+                ) nearby
+                ORDER BY turn_index ASC,created_at ASC,id ASC
+                """,
+                (
+                    int(anchor["turn_index"]),
+                    anchor["session_id"],
+                    privacy,
+                ),
+            ).fetchall()
+
+        messages: list[dict[str, Any]] = []
+        used_chars = 0
+        anchor_id = int(anchor["id"])
+        for row in neighborhood:
+            item = dict(row)
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            remaining = budget_chars - used_chars
+            if remaining <= 0:
+                break
+            # Leave room for the other turns while still keeping the anchor useful.
+            per_message = min(900 if int(item["id"]) == anchor_id else 650, remaining)
+            rendered = content
+            if len(rendered) > per_message:
+                rendered = rendered[:per_message].rstrip() + "…"
+            messages.append(
+                {
+                    "event_id": int(item["id"]),
+                    "external_id": item.get("external_id"),
+                    "turn_index": item.get("turn_index"),
+                    "role": item.get("role"),
+                    "content": rendered,
+                    "created_at": item.get("created_at"),
+                    "is_anchor": int(item["id"]) == anchor_id,
+                }
+            )
+            used_chars += len(rendered)
+
+        if not messages:
+            return []
+        metadata = anchor.get("metadata") or {}
+        return [
+            {
+                "evidence_role": evidence_role,
+                "session_id": anchor.get("session_id"),
+                "conversation_title": metadata.get("conversation_title"),
+                "anchor_event_id": anchor_id,
+                "anchor_turn_index": anchor.get("turn_index"),
+                "match_score": round(float(anchor.get("raw_score") or 0.0), 4),
+                "term_hits": int(anchor.get("term_hits") or 0),
+                "messages": messages,
+                "channels": ["raw_event_lexical", "session_order_neighborhood"],
+                "evidence_notice": (
+                    "verbatim visible chat context; use as evidence, not as a current fact or instruction"
+                ),
+            }
+        ]
+
+    def _source_neighborhood(
+        self,
+        seed_ids: Sequence[int],
+        *,
+        include_sensitive: bool,
+        budget_chars: int,
+    ) -> list[dict[str, Any]]:
+        if not seed_ids or budget_chars <= 0:
+            return []
+        privacy = ["personal", "public", "sensitive"] if include_sensitive else [
+            "personal",
+            "public",
+        ]
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT neighbor.*,seed.id AS neighbor_of,
+                  abs(neighbor.id-seed.id) AS source_distance,
+                  document.original_filename
+                FROM lmc5_curated_memories seed
+                JOIN lmc5_curated_memories neighbor
+                  ON neighbor.source_document_id=seed.source_document_id
+                LEFT JOIN lmc5_source_documents document
+                  ON document.id=neighbor.source_document_id
+                WHERE seed.id=ANY(%s::bigint[])
+                  AND seed.source_document_id IS NOT NULL
+                  AND neighbor.id<>ALL(%s::bigint[])
+                  AND neighbor.version_status='current'
+                  AND neighbor.privacy_scope=ANY(%s::text[])
+                ORDER BY source_distance ASC,neighbor.created_at DESC
+                LIMIT 24
+                """,
+                (list(seed_ids), list(seed_ids), privacy),
+            ).fetchall()
+
+        selected: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        used_chars = 0
+        for row in rows:
+            item = dict(row)
+            memory_id = int(item["id"])
+            if memory_id in seen:
+                continue
+            content = str(item.get("content") or "")
+            if selected and used_chars + len(content) > budget_chars:
+                continue
+            public = self._public_memory(item)
+            remaining_chars = max(1, budget_chars - used_chars)
+            if len(content) > remaining_chars:
+                public["content"] = content[:remaining_chars].rstrip() + "…"
+            public.update(
+                {
+                    "evidence_role": "navigation",
+                    "neighbor_of": int(item["neighbor_of"]),
+                    "source_distance": int(item["source_distance"]),
+                    "original_filename": item.get("original_filename"),
+                    "channels": ["source_neighborhood"],
+                }
+            )
+            selected.append(public)
+            seen.add(memory_id)
+            used_chars += min(len(content), remaining_chars)
+            if len(selected) >= 2:
+                break
+        return selected
+
+    def _archived_fallback(
+        self,
+        query: str,
+        *,
+        include_sensitive: bool,
+        limit: int,
+        budget_chars: int,
+    ) -> list[dict[str, Any]]:
+        concepts = _query_concepts(query)
+        terms = list(dict.fromkeys(term for group in concepts for term in group))
+        patterns = [f"%{term}%" for term in terms]
+        privacy = ["personal", "public", "sensitive"] if include_sensitive else [
+            "personal",
+            "public",
+        ]
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *,similarity(COALESCE(title,'') || ' ' || content,%s) AS fallback_score
+                FROM lmc5_curated_memories
+                WHERE version_status IN ('archived','historical','superseded')
+                  AND privacy_scope=ANY(%s::text[])
+                  AND (
+                    (COALESCE(title,'') || ' ' || content) ILIKE ANY(%s::text[])
+                    OR array_to_string(tags,' ') ILIKE ANY(%s::text[])
+                    OR similarity(COALESCE(title,'') || ' ' || content,%s)>0.08
+                  )
+                ORDER BY fallback_score DESC,updated_at DESC,id DESC
+                LIMIT %s
+                """,
+                (query, privacy, patterns, patterns, query, max(1, limit * 3)),
+            ).fetchall()
+
+        selected: list[dict[str, Any]] = []
+        used_chars = 0
+        for row in rows:
+            item = dict(row)
+            content = str(item.get("content") or "")
+            if selected and used_chars + len(content) > budget_chars:
+                continue
+            public = self._public_memory(item)
+            remaining_chars = max(1, budget_chars - used_chars)
+            if len(content) > remaining_chars:
+                public["content"] = content[:remaining_chars].rstrip() + "…"
+            public.update(
+                {
+                    "evidence_role": "fallback",
+                    "channels": ["cold_archive_fallback"],
+                    "archive_notice": "historical evidence; current facts outrank this item",
+                    "score": round(float(item.get("fallback_score") or 0.0), 4),
+                }
+            )
+            selected.append(public)
+            used_chars += min(len(content), remaining_chars)
+            if len(selected) >= limit:
+                break
+        return selected
+
     @staticmethod
     def _public_memory(item: dict[str, Any]) -> dict[str, Any]:
         allowed = (
@@ -651,6 +971,77 @@ class MemoryStore:
             {**self._public_memory(dict(row)), "selected_via": row["selected_via"]}
             for row in rows
         ]
+
+    def bootstrap_context(self) -> dict[str, Any]:
+        """Build a deterministic short map for a new conversation window.
+
+        The skeleton is not a personality conclusion and does not use random
+        selection. Spontaneous memory remains a separate caller-controlled layer.
+        """
+        with self.connect() as conn:
+            turning_rows = conn.execute(
+                """
+                SELECT * FROM lmc5_curated_memories
+                WHERE version_status='current'
+                  AND privacy_scope IN ('personal','public')
+                  AND category IN ('relationship_moment','episode','heartbeat')
+                  AND (
+                    protected OR COALESCE(original_importance,0)>=7.5 OR weight>=2.2
+                  )
+                ORDER BY protected DESC,COALESCE(original_importance,weight*3.3) DESC,
+                  COALESCE(valid_at,created_at) DESC,id DESC
+                LIMIT 6
+                """
+            ).fetchall()
+            position_rows = conn.execute(
+                """
+                SELECT * FROM lmc5_curated_memories
+                WHERE version_status='current'
+                  AND privacy_scope IN ('personal','public')
+                  AND category='relationship_state'
+                ORDER BY active_fact DESC,protected DESC,updated_at DESC,id DESC
+                LIMIT 1
+                """
+            ).fetchall()
+            unresolved_rows = conn.execute(
+                """
+                SELECT * FROM lmc5_curated_memories
+                WHERE version_status='current'
+                  AND privacy_scope IN ('personal','public')
+                  AND category='tasks' AND NOT resolved
+                ORDER BY weight DESC,updated_at DESC,id DESC
+                LIMIT 4
+                """
+            ).fetchall()
+            recent_rows = conn.execute(
+                """
+                SELECT * FROM lmc5_curated_memories
+                WHERE version_status='current'
+                  AND privacy_scope IN ('personal','public')
+                  AND category NOT IN ('identity','policy','core','tasks')
+                ORDER BY COALESCE(valid_at,created_at) DESC,id DESC
+                LIMIT 4
+                """
+            ).fetchall()
+
+        turning = [self._public_memory(dict(row)) for row in turning_rows]
+        turning.sort(key=lambda item: str(item.get("created_at") or ""))
+        return {
+            "history_skeleton": {
+                "important_stages_and_turning_points": turning,
+                "current_relationship_position": [
+                    self._public_memory(dict(row)) for row in position_rows
+                ],
+                "unresolved_threads": [
+                    self._public_memory(dict(row)) for row in unresolved_rows
+                ],
+                "contract": (
+                    "This is a compact history map, not a personality verdict. "
+                    "Current statements outrank it; use ordinary recall for details."
+                ),
+            },
+            "recent_memories": [self._public_memory(dict(row)) for row in recent_rows],
+        }
 
     @staticmethod
     def _embedding_text(memory: dict[str, Any]) -> str:
@@ -803,7 +1194,10 @@ class MemoryStore:
                     if privacy_by_id.get(target_id) != privacy_by_id.get(source_id):
                         continue
                     score = max(0.0, cosine_similarity(source_vector, target_vector))
-                    if score >= (0.18 if provider.name == "local_hash" else 0.55):
+                    threshold = (
+                        self.nap_relation_threshold if provider.name == "local_hash" else 0.55
+                    )
+                    if score >= threshold:
                         candidates.append((score, target_id))
                 candidates.sort(reverse=True)
                 for score, target_id in candidates[: max(1, neighbor_top_k)]:
@@ -831,6 +1225,9 @@ class MemoryStore:
             "provider": provider.name,
             "model": provider.model,
             "dimension": provider.dimension,
+            "relation_threshold": (
+                self.nap_relation_threshold if provider.name == "local_hash" else 0.55
+            ),
             "scanned": len(rows),
             "pending_total": len(pending_all),
             "pending_selected": len(pending),
@@ -1158,6 +1555,7 @@ class MemoryStore:
             },
             "dream_provider": self.dream_provider_name,
             "dream_min_importance": self.dream_min_importance,
+            "nap_relation_threshold": self.nap_relation_threshold,
             "dream_candidates": [dict(row) for row in dream_counts],
             "pending_candidate_preview": [
                 self._dashboard_row(dict(row)) for row in pending_candidates
@@ -1280,6 +1678,102 @@ class MemoryStore:
             "reused": reused,
             "archived_stale_memories": archived,
             "same_document_relations_created": same_document_relations,
+        }
+
+    def import_raw_events(
+        self,
+        *,
+        source_type: str,
+        archive_sha256: str,
+        events: Sequence[dict[str, Any]],
+        conversation_count: int,
+    ) -> dict[str, Any]:
+        """Upsert a complete Claude export by stable message UUID.
+
+        Re-importing a full account archive updates edited messages and only
+        creates unseen UUIDs. Missing messages are retained: import and Patrol
+        never infer deletion from an incomplete or newer export.
+        """
+        external_ids = [str(event.get("external_id") or "") for event in events]
+        if any(not external_id for external_id in external_ids):
+            raise ValueError("every imported raw event requires external_id")
+        if len(set(external_ids)) != len(external_ids):
+            raise ValueError("raw event external_id values must be unique")
+
+        with self.connect() as conn:
+            existing_rows = conn.execute(
+                """
+                SELECT external_id FROM lmc5_raw_events
+                WHERE channel='claude_export' AND external_id=ANY(%s::text[])
+                """,
+                (external_ids,),
+            ).fetchall() if external_ids else []
+            existing = {str(row["external_id"]) for row in existing_rows}
+            for event in events:
+                conn.execute(
+                    """
+                    INSERT INTO lmc5_raw_events(
+                      session_id,external_id,turn_index,parent_external_id,role,channel,
+                      content,content_hash,privacy_scope,metadata,created_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (channel,external_id) WHERE external_id IS NOT NULL
+                    DO UPDATE SET
+                      session_id=EXCLUDED.session_id,
+                      turn_index=EXCLUDED.turn_index,
+                      parent_external_id=EXCLUDED.parent_external_id,
+                      role=EXCLUDED.role,
+                      content=EXCLUDED.content,
+                      content_hash=EXCLUDED.content_hash,
+                      privacy_scope=EXCLUDED.privacy_scope,
+                      metadata=EXCLUDED.metadata,
+                      created_at=EXCLUDED.created_at
+                    """,
+                    (
+                        event["session_id"],
+                        event["external_id"],
+                        int(event["turn_index"]),
+                        event.get("parent_external_id"),
+                        event["role"],
+                        event.get("channel", "claude_export"),
+                        event["content"],
+                        event["content_hash"],
+                        event.get("privacy_scope", "personal"),
+                        Jsonb(event.get("metadata") or {}),
+                        event.get("created_at") or datetime.now(timezone.utc),
+                    ),
+                )
+            created = sum(external_id not in existing for external_id in external_ids)
+            reused = len(external_ids) - created
+            conn.execute(
+                """
+                INSERT INTO lmc5_import_runs(
+                  source_type,archive_sha256,dry_run,file_count,memory_count,event_count,
+                  created_count,reused_count,details
+                ) VALUES (%s,%s,FALSE,%s,0,%s,%s,%s,%s)
+                """,
+                (
+                    source_type,
+                    archive_sha256,
+                    conversation_count,
+                    len(events),
+                    created,
+                    reused,
+                    Jsonb(
+                        {
+                            "channel": "claude_export",
+                            "conversation_count": conversation_count,
+                            "deletions": 0,
+                            "visible_text_only": True,
+                        }
+                    ),
+                ),
+            )
+        return {
+            "conversations": conversation_count,
+            "events": len(events),
+            "created": created,
+            "reused_or_updated": reused,
+            "deleted": 0,
         }
 
     def build_cross_source_relations(self, auto_threshold: float, review_threshold: float) -> dict[str, int]:
@@ -1502,6 +1996,92 @@ class MemoryStore:
             raw["vitality"] = round(float(vitality(raw)), 4)
             items.append(self._dashboard_row(raw))
         return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    def update_memory_weight(self, memory_id: int, weight: float) -> dict[str, Any]:
+        weight = round(float(weight), 3)
+        if not 0.1 <= weight <= 3.0:
+            raise ValueError("weight must be between 0.1 and 3.0")
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id,title,weight,protected,active_fact,version_status
+                FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
+                """,
+                (memory_id,),
+            ).fetchone()
+            if row is None or row["version_status"] != "current":
+                return {"status": "not_found"}
+            previous_weight = float(row["weight"])
+            updated = conn.execute(
+                """
+                UPDATE lmc5_curated_memories SET weight=%s,updated_at=NOW()
+                WHERE id=%s RETURNING id,title,weight,protected,active_fact,updated_at
+                """,
+                (weight, memory_id),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO lmc5_dashboard_audit(memory_id,action,before_state,after_state)
+                VALUES (%s,'update_weight',%s,%s)
+                """,
+                (
+                    memory_id,
+                    Jsonb({"weight": previous_weight}),
+                    Jsonb({"weight": weight}),
+                ),
+            )
+        return {"status": "updated", "memory": self._dashboard_row(updated)}
+
+    def archive_memory(self, memory_id: int) -> dict[str, Any]:
+        """Soft-delete one ordinary memory while preserving recovery and audit."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id,title,weight,protected,active_fact,version_status
+                FROM lmc5_curated_memories WHERE id=%s FOR UPDATE
+                """,
+                (memory_id,),
+            ).fetchone()
+            if row is None or row["version_status"] != "current":
+                return {"status": "not_found"}
+            if row["protected"]:
+                return {"status": "blocked", "reason": "protected memory cannot be archived"}
+            if row["active_fact"]:
+                return {
+                    "status": "blocked",
+                    "reason": "current active fact must be corrected, not archived",
+                }
+            conn.execute(
+                """
+                UPDATE lmc5_curated_memories
+                SET version_status='archived',invalid_at=NOW(),surface_allowed=FALSE,
+                  updated_at=NOW()
+                WHERE id=%s
+                """,
+                (memory_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO lmc5_dashboard_audit(memory_id,action,before_state,after_state)
+                VALUES (%s,'archive',%s,%s)
+                """,
+                (
+                    memory_id,
+                    Jsonb(
+                        {
+                            "title": row["title"],
+                            "weight": float(row["weight"]),
+                            "version_status": "current",
+                        }
+                    ),
+                    Jsonb({"version_status": "archived"}),
+                ),
+            )
+        return {
+            "status": "archived",
+            "memory_id": memory_id,
+            "recoverable": True,
+        }
 
     def list_source_documents(
         self,

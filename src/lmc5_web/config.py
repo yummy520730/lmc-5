@@ -68,6 +68,7 @@ class Settings:
     dream_min_importance: float
     nap_interval_minutes: int
     nap_batch_size: int
+    nap_relation_threshold: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -90,7 +91,7 @@ class Settings:
             port=_int("PORT", 8080),
             mcp_auth_mode=auth_mode,
             timezone=timezone,
-            max_import_bytes=_int("LMC5_MAX_IMPORT_MB", 25) * 1024 * 1024,
+            max_import_bytes=_int("LMC5_MAX_IMPORT_MB", 64) * 1024 * 1024,
             recall_limit=_int("LMC5_RECALL_LIMIT", 8),
             pulse_size=_int("LMC5_PULSE_SIZE", 2),
             relation_auto_threshold=_float("LMC5_RELATION_AUTO_THRESHOLD", 0.45),
@@ -114,6 +115,9 @@ class Settings:
             ),
             nap_interval_minutes=_int("LMC5_NAP_INTERVAL_MINUTES", 60, minimum=5),
             nap_batch_size=_int("LMC5_NAP_BATCH_SIZE", 40, minimum=1),
+            nap_relation_threshold=_bounded_float(
+                "LMC5_NAP_RELATION_THRESHOLD", 0.24, 0.10, 0.95
+            ),
         )
 
     def prepare_directories(self) -> None:

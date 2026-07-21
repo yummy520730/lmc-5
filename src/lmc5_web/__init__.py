@@ -1,3 +1,3 @@
 """Claude Web runtime for an LMC-5 memory store."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.3"

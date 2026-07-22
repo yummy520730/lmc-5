@@ -1878,7 +1878,9 @@ class MemoryStore:
                   count(*) FILTER (WHERE version_status='review') AS review,
                   (SELECT count(*) FROM lmc5_source_documents) AS documents,
                   (SELECT count(*) FROM lmc5_raw_events) AS events,
-                  (SELECT count(*) FROM lmc5_memory_relations WHERE status='current') AS relations
+                  (SELECT count(*) FROM lmc5_memory_relations WHERE status='current') AS relations,
+                  (SELECT count(*) FROM lmc5_dream_candidates WHERE status='pending')
+                    AS dream_pending
                 FROM lmc5_curated_memories
                 """
             ).fetchone()
@@ -1912,6 +1914,198 @@ class MemoryStore:
             "categories": [self._dashboard_row(item) for item in categories],
             "sources": [self._dashboard_row(item) for item in sources],
             "privacy": [self._dashboard_row(item) for item in privacy],
+        }
+
+    def list_dream_candidates(
+        self,
+        *,
+        query: str = "",
+        category: str = "",
+        include_sensitive: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List pending night-dream candidates for explicit owner review."""
+        query = query.strip()[:500]
+        category = category.strip().lower()
+        if category and category not in ALLOWED_CATEGORIES:
+            raise ValueError(f"unsupported category: {category}")
+
+        conditions = ["status='pending'"]
+        params: list[Any] = []
+        if not include_sensitive:
+            conditions.append("privacy_scope IN ('personal','public')")
+        if category:
+            conditions.append("category=%s")
+            params.append(category)
+        if query:
+            pattern = f"%{query}%"
+            conditions.append("(title ILIKE %s OR content ILIKE %s)")
+            params.extend((pattern, pattern))
+        where_sql = " AND ".join(conditions)
+
+        with self.connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT count(*) AS count FROM lmc5_dream_candidates WHERE {where_sql}",
+                    params,
+                ).fetchone()["count"]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT id,title,content,category,thread,importance,privacy_scope,
+                  protected,evidence_event_ids,relation_terms,proposer,status,created_at
+                FROM lmc5_dream_candidates
+                WHERE {where_sql}
+                ORDER BY importance DESC,created_at DESC,id DESC
+                LIMIT %s OFFSET %s
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        return {
+            "items": [self._dashboard_row(dict(row)) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def review_dream_candidate(self, candidate_id: int, decision: str) -> dict[str, Any]:
+        """Approve a pending candidate into curated memory or reject it safely."""
+        decision = decision.strip().lower()
+        if decision not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+
+        with self.connect() as conn:
+            candidate = conn.execute(
+                """
+                SELECT id,run_id,candidate_key,title,content,category,thread,importance,
+                  privacy_scope,protected,evidence_event_ids,relation_terms,proposer,status
+                FROM lmc5_dream_candidates WHERE id=%s FOR UPDATE
+                """,
+                (candidate_id,),
+            ).fetchone()
+            if candidate is None:
+                return {"status": "not_found"}
+            if candidate["status"] != "pending":
+                return {
+                    "status": "already_reviewed",
+                    "candidate_status": candidate["status"],
+                }
+
+            evidence_event_ids = list(candidate["evidence_event_ids"] or [])
+            if decision == "reject":
+                conn.execute(
+                    """
+                    UPDATE lmc5_dream_candidates
+                    SET status='rejected',reviewed_at=NOW() WHERE id=%s
+                    """,
+                    (candidate_id,),
+                )
+                if evidence_event_ids:
+                    conn.execute(
+                        """
+                        UPDATE lmc5_raw_events
+                        SET digested_at=COALESCE(digested_at,NOW()),
+                          dream_run_id=COALESCE(dream_run_id,%s)
+                        WHERE id=ANY(%s)
+                        """,
+                        (candidate["run_id"], evidence_event_ids),
+                    )
+                return {"status": "rejected", "candidate_id": candidate_id}
+
+            formal_title = re.sub(
+                r"^夜梦候选\s*[：:]\s*", "", str(candidate["title"])
+            ).strip() or str(candidate["title"])
+            duplicate = conn.execute(
+                """
+                SELECT id FROM lmc5_curated_memories
+                WHERE version_status='current' AND (
+                  lower(title)=lower(%s) OR
+                  similarity(COALESCE(title,'') || ' ' || content,%s) > 0.78
+                ) ORDER BY created_at DESC LIMIT 1
+                """,
+                (formal_title, f"{formal_title} {candidate['content']}"),
+            ).fetchone()
+            if duplicate:
+                memory_id = int(duplicate["id"])
+                conn.execute(
+                    """
+                    UPDATE lmc5_dream_candidates
+                    SET status='duplicate',reviewed_at=NOW(),applied_memory_id=%s
+                    WHERE id=%s
+                    """,
+                    (memory_id, candidate_id),
+                )
+                result_status = "duplicate"
+                created = False
+            else:
+                privacy_scope = (
+                    candidate["privacy_scope"]
+                    if candidate["privacy_scope"] in {"personal", "sensitive", "public"}
+                    else "personal"
+                )
+                category = (
+                    candidate["category"]
+                    if candidate["category"] in ALLOWED_CATEGORIES
+                    else "episode"
+                )
+                importance = float(candidate["importance"])
+                memory_id, created = self._upsert_memory(
+                    conn,
+                    {
+                        "legacy_source": "night_dream_candidate",
+                        "legacy_id": candidate["candidate_key"],
+                        "source": f"night_dream:{candidate['proposer']}",
+                        "category": category,
+                        "title": formal_title,
+                        "content": candidate["content"],
+                        "thread": candidate["thread"],
+                        "tags": ["night_dream", *(candidate["relation_terms"] or [])],
+                        "metadata": {
+                            "candidate_id": candidate_id,
+                            "evidence_event_ids": evidence_event_ids,
+                            "proposer": candidate["proposer"],
+                            "approved_by": "dashboard",
+                        },
+                        "weight": min(3.0, round(importance / 3.3, 3)),
+                        "original_importance": importance,
+                        "protected": bool(
+                            candidate["protected"] and privacy_scope != "sensitive"
+                        ),
+                        "privacy_scope": privacy_scope,
+                        "surface_allowed": (
+                            privacy_scope in {"personal", "public"}
+                            and category
+                            not in {"health", "legal", "knowledge", "tasks", "conversation"}
+                        ),
+                        "confidence": 0.78 if candidate["proposer"] == "gemini" else 0.62,
+                    },
+                )
+                conn.execute(
+                    """
+                    UPDATE lmc5_dream_candidates
+                    SET status='applied',reviewed_at=NOW(),applied_memory_id=%s
+                    WHERE id=%s
+                    """,
+                    (memory_id, candidate_id),
+                )
+                result_status = "applied"
+
+            if evidence_event_ids:
+                conn.execute(
+                    """
+                    UPDATE lmc5_raw_events
+                    SET digested_at=COALESCE(digested_at,NOW()),
+                      dream_run_id=COALESCE(dream_run_id,%s)
+                    WHERE id=ANY(%s)
+                    """,
+                    (candidate["run_id"], evidence_event_ids),
+                )
+        return {
+            "status": result_status,
+            "candidate_id": candidate_id,
+            "memory_id": memory_id,
+            "created": created,
         }
 
     def list_memories(

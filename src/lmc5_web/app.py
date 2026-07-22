@@ -524,6 +524,49 @@ async def dashboard_memories(request: Request) -> JSONResponse:
         return _private_json({"error": "memory list is unavailable"}, status_code=503)
 
 
+async def dashboard_candidates(request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.to_thread(
+            store.list_dream_candidates,
+            query=request.query_params.get("q", ""),
+            category=request.query_params.get("category", ""),
+            include_sensitive=_query_bool(request, "include_sensitive"),
+            limit=_bounded_query_int(request, "limit", 20, 1, 100),
+            offset=_bounded_query_int(request, "offset", 0, 0, 1_000_000),
+        )
+        return _private_json(result)
+    except ValueError as exc:
+        return _private_json({"error": str(exc)}, status_code=400)
+    except Exception:
+        log.exception("dashboard candidate listing failed")
+        return _private_json({"error": "candidate list is unavailable"}, status_code=503)
+
+
+async def dashboard_candidate_review(request: Request) -> JSONResponse:
+    try:
+        candidate_id = int(request.path_params["candidate_id"])
+        payload = await request.json()
+        if not isinstance(payload, dict) or set(payload) != {"decision"}:
+            raise ValueError("request body must set decision")
+        result = await asyncio.to_thread(
+            store.review_dream_candidate,
+            candidate_id,
+            str(payload["decision"]),
+        )
+        if result["status"] == "not_found":
+            return _private_json({"error": "candidate not found"}, status_code=404)
+        if result["status"] == "already_reviewed":
+            return _private_json(
+                {"error": "candidate was already reviewed", **result}, status_code=409
+            )
+        return _private_json(result)
+    except (TypeError, ValueError) as exc:
+        return _private_json({"error": str(exc)}, status_code=400)
+    except Exception:
+        log.exception("dashboard candidate review failed")
+        return _private_json({"error": "candidate review is unavailable"}, status_code=503)
+
+
 async def dashboard_memory_update(request: Request) -> JSONResponse:
     try:
         memory_id = int(request.path_params["memory_id"])
@@ -747,6 +790,12 @@ routes = [
     Route("/healthz", health, methods=["GET"]),
     Route("/api/dashboard/stats", dashboard_stats, methods=["GET"]),
     Route("/api/dashboard/memories", dashboard_memories, methods=["GET"]),
+    Route("/api/dashboard/candidates", dashboard_candidates, methods=["GET"]),
+    Route(
+        "/api/dashboard/candidates/{candidate_id:int}",
+        dashboard_candidate_review,
+        methods=["PATCH"],
+    ),
     Route(
         "/api/dashboard/memories/{memory_id:int}",
         dashboard_memory_update,

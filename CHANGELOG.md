@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.3.5 - 2026-07-22
+
+- Add an owner-only pending dream-candidate review list with title and source evidence.
+- Allow explicit approve to promote a candidate into curated memory while keeping evidence IDs.
+- Allow explicit reject to discard a candidate from the queue without deleting raw transcript evidence.
+- Expose the pending count and add Cloudflare Worker routes for candidate review.
+
+## 0.3.4 - 2026-07-21
+
+- Turn dashboard archive into a visible, recoverable recycle bin without exposing
+  importer-created cold archives.
+- Allow protected non-current-fact memories to be explicitly unlocked so normal
+  vitality decay resumes and the memory can later be archived.
+- Replace an active current fact with an existing curated memory while preserving
+  the old fact as a non-surfacing superseded historical version.
+- Audit recycle-bin restore, protection changes, and current-fact replacement.
+
+## 0.3.3 - 2026-07-21
+
+- Import Claude account data exports as ordered raw events using stable conversation and message UUIDs.
+- Keep only user-visible text; exclude thinking blocks, tool calls/results, and credential-pattern messages.
+- Make repeated full exports incremental: update known UUIDs, create only new messages, and never infer deletion.
+- Add raw-event lexical fallback plus a bounded five-message neighborhood in original conversation order.
+- Keep raw transcript evidence separate from curated memory, graph associations, and cold archived fallback.
+- Raise the default compressed import limit to 64 MB and the safe uncompressed ceiling to 150 MB.
+
+## 0.3.2 - 2026-07-21
+
+- Raise the default local-hash Nap relation threshold from 0.18 to 0.24 and expose it as
+  `LMC5_NAP_RELATION_THRESHOLD`.
+- Add `memory_bootstrap` so every new window receives a deterministic short history skeleton
+  before recent and spontaneous memory.
+- Add explicit layered recall roles for current authority, same-source navigation, graph
+  association, and cold archived fallback.
+- Add owner-only dashboard APIs for bounded weight edits and audited, recoverable archive.
+- Block dashboard archive for protected memories and active current facts.
+- Add Cloudflare Worker forwarding and Pages controls for weight changes and archive.
+
+## 0.3.1 - 2026-07-20
+
+- Add private local-hash vector recall that works without pgvector or an external API key.
+- Add bounded hourly Nap backfill for changed memories and safe same-privacy orphan linking.
+- Add evidence-preserving night-dream candidates with `dry_run` as the default mode.
+- Add optional Gemini embedding and structured dream providers behind explicit configuration.
+- Add a daily read-only metabolism patrol; it reports missing vectors, orphans and duplicates
+  but never deletes memory.
+- Add `memory_maintenance_status` for on-demand vector, dream-candidate and patrol diagnostics.
+- Keep maintenance failures isolated so lexical, entity, graph and vitality recall stay available.
+
 ## 0.3.0 - 2026-07-18
 
 - Add owner-token-protected REST endpoints for memory dashboard statistics.
@@ -11,6 +60,10 @@
 - Expand multi-term queries with concept coverage and common employment/legal synonyms.
 - Keep explicitly requested sensitive memories at normal recall weight.
 - Link sections from the same LTM Day patch and archive stale split records on re-import.
+- Fix PostgreSQL source statistics grouping for the owner memory dashboard.
+- Reserve explicit sensitive matches without applying a privacy score penalty.
+- Rewrite weak daily-patch titles with deterministic local body hints.
+- Make `memory_time` on-demand and change the reply header to `[YY/MM/DD｜HH:MM]`.
 
 ## Unreleased
 

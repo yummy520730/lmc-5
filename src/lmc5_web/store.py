@@ -1499,6 +1499,112 @@ class MemoryStore:
             )
             return {"status": "error", "run_id": run_id, "error": error}
 
+    def propose_external_candidate(
+        self,
+        *,
+        title: str,
+        content: str,
+        external_id: str = "",
+        category: str = "episode",
+        thread: str = "reflection",
+        importance: float = 6.5,
+        privacy_scope: str = "personal",
+        relation_terms: Sequence[str] | None = None,
+        proposer: str = "xinchao",
+    ) -> dict[str, Any]:
+        """Queue an external reflection for owner review without curating it."""
+        title = re.sub(r"\s+", " ", title).strip()[:240]
+        content = content.strip()[:12_000]
+        external_id = external_id.strip()[:240]
+        category = category.strip().lower()
+        thread = thread.strip().lower()[:80] or "reflection"
+        privacy_scope = privacy_scope.strip().lower()
+        proposer = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", proposer).strip("_")[:80] or "external"
+        importance = max(1.0, min(10.0, float(importance)))
+        if not title:
+            raise ValueError("candidate title is required")
+        if not content:
+            raise ValueError("candidate content is required")
+        if category not in ALLOWED_CATEGORIES:
+            raise ValueError(f"unsupported category: {category}")
+        if privacy_scope not in {"personal", "sensitive", "public"}:
+            raise ValueError("privacy_scope must be personal, sensitive, or public")
+
+        terms = list(
+            dict.fromkeys(
+                re.sub(r"\s+", " ", str(term)).strip()[:80]
+                for term in (relation_terms or [])
+                if str(term).strip()
+            )
+        )[:16]
+        key_material = external_id or f"{title}\n{content}"
+        candidate_key = hashlib.sha256(
+            f"external:{proposer}:{key_material}".encode("utf-8")
+        ).hexdigest()[:32]
+
+        with self.connect() as conn:
+            run_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO lmc5_dream_runs(
+                      mode,provider,status,event_count,candidate_count,report,finished_at
+                    ) VALUES ('dry_run',%s,'ok',0,1,%s,NOW()) RETURNING id
+                    """,
+                    (
+                        proposer,
+                        Jsonb(
+                            {
+                                "source": "external_candidate",
+                                "external_id": external_id,
+                                "review_required": True,
+                            }
+                        ),
+                    ),
+                ).fetchone()["id"]
+            )
+            row = conn.execute(
+                """
+                INSERT INTO lmc5_dream_candidates(
+                  run_id,candidate_key,title,content,category,thread,importance,
+                  privacy_scope,protected,evidence_event_ids,relation_terms,proposer,status
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,FALSE,'{}',%s,%s,'pending')
+                ON CONFLICT (candidate_key) DO UPDATE SET
+                  run_id=EXCLUDED.run_id,
+                  title=CASE
+                    WHEN lmc5_dream_candidates.status='pending' THEN EXCLUDED.title
+                    ELSE lmc5_dream_candidates.title
+                  END,
+                  content=CASE
+                    WHEN lmc5_dream_candidates.status='pending' THEN EXCLUDED.content
+                    ELSE lmc5_dream_candidates.content
+                  END,
+                  relation_terms=CASE
+                    WHEN lmc5_dream_candidates.status='pending' THEN EXCLUDED.relation_terms
+                    ELSE lmc5_dream_candidates.relation_terms
+                  END
+                RETURNING id,status,created_at
+                """,
+                (
+                    run_id,
+                    candidate_key,
+                    title,
+                    content,
+                    category,
+                    thread,
+                    importance,
+                    privacy_scope,
+                    terms,
+                    proposer,
+                ),
+            ).fetchone()
+        return {
+            "status": str(row["status"]),
+            "candidate_id": int(row["id"]),
+            "candidate_key": candidate_key,
+            "review_required": True,
+            "created_at": row["created_at"].isoformat(),
+        }
+
     def maintenance_status(self) -> dict[str, Any]:
         with self.connect() as conn:
             runs = conn.execute(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -29,6 +30,7 @@ from .intelligence import (
 )
 from .oauth import LMC5OAuthProvider, OAuthLoginError, OAUTH_SCOPES, render_oauth_login
 from .store import MemoryStore
+from .xinchao import XinchaoClient
 
 
 log = logging.getLogger("lmc5_web")
@@ -78,6 +80,11 @@ store = MemoryStore(
     dream_min_importance=settings.dream_min_importance,
     nap_relation_threshold=settings.nap_relation_threshold,
 )
+xinchao = XinchaoClient(
+    settings.xinchao_base_url,
+    settings.xinchao_service_token,
+)
+_background_tasks: set[asyncio.Task] = set()
 
 OAUTH_PAGE_CSP = (
     "default-src 'none'; style-src 'unsafe-inline'; "
@@ -244,6 +251,8 @@ async def memory_context(
             channel="claude_web",
             metadata={"captured_via": "memory_context"},
         )
+    if xinchao.configured:
+        _schedule_xinchao_heartbeat()
     layered, pulse = await asyncio.gather(
         asyncio.to_thread(
             store.recall_layered,
@@ -441,6 +450,56 @@ async def memory_maintenance_status() -> dict:
     return await asyncio.to_thread(store.maintenance_status)
 
 
+async def _safe_xinchao_heartbeat() -> None:
+    try:
+        await xinchao.conversation_event()
+    except Exception:
+        log.debug("xinchao heartbeat failed", exc_info=True)
+
+
+def _schedule_xinchao_heartbeat() -> None:
+    task = asyncio.create_task(_safe_xinchao_heartbeat())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+@mcp.tool()
+async def mind_context() -> dict:
+    """Read the current dynamic-mind state when it helps the conversation.
+
+    This is a changing state snapshot, not a personality verdict or a historical
+    fact. Call at window start or when current drives, thoughts, fatigue, sleep,
+    or dream residue materially matter. Do not call before every reply.
+    """
+    snapshot = await xinchao.snapshot()
+    return {
+        **snapshot,
+        "guidance": (
+            "Treat this as temporary internal weather. Current user statements and "
+            "stable memory outrank it; never turn one snapshot into a personality claim."
+        ),
+    }
+
+
+@mcp.tool()
+async def mind_event(
+    satisfied_drives: list[str] | None = None,
+    flash_thoughts: list[dict] | None = None,
+) -> dict:
+    """Send one meaningful interaction signal to the dynamic-mind service.
+
+    Use after a clearly meaningful exchange, not for routine chatter. Only send
+    drive keys actually satisfied in the visible conversation and short thoughts
+    grounded in what was said. Never send hidden reasoning, guesses, or secrets.
+    """
+    if not xinchao.configured:
+        return {"configured": False, "connected": False}
+    return await xinchao.conversation_event(
+        satisfied_drives=satisfied_drives,
+        flash_thoughts=flash_thoughts,
+    )
+
+
 async def homepage(_: Request) -> HTMLResponse:
     path = Path(__file__).parent / "static" / "index.html"
     return HTMLResponse(path.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
@@ -470,6 +529,10 @@ async def health(_: Request) -> JSONResponse:
                 "dream_provider": settings.dream_provider,
                 "dream_mode": settings.dream_mode,
             },
+            "dynamic_mind": {
+                "configured": xinchao.configured,
+                "memory_bridge_configured": bool(settings.xinchao_bridge_token),
+            },
         },
         headers={"Cache-Control": "no-store"},
         status_code=200 if database.get("connected") else 503,
@@ -496,12 +559,127 @@ def _private_json(data: dict, *, status_code: int = 200) -> JSONResponse:
     return JSONResponse(data, status_code=status_code, headers={"Cache-Control": "no-store"})
 
 
+def _xinchao_bridge_authorized(request: Request) -> bool:
+    if not settings.xinchao_bridge_token:
+        return False
+    authorization = request.headers.get("authorization", "")
+    supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    return bool(supplied) and secrets.compare_digest(
+        supplied,
+        settings.xinchao_bridge_token,
+    )
+
+
+def _bridge_reject(status_code: int, message: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": message},
+        status_code=status_code,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def xinchao_bridge_recall(request: Request) -> JSONResponse:
+    if not settings.xinchao_bridge_token:
+        return _bridge_reject(503, "xinchao memory bridge is not configured")
+    if not _xinchao_bridge_authorized(request):
+        return _bridge_reject(401, "unauthorized")
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        query = str(payload.get("query") or "").strip()[:500]
+        if not query:
+            raise ValueError("query is required")
+        max_results = max(1, min(10, int(payload.get("max_results", 3))))
+        max_tokens = max(200, min(3000, int(payload.get("max_tokens", 800))))
+        layered = await asyncio.to_thread(
+            store.recall_layered,
+            query,
+            limit=max_results,
+            include_sensitive=False,
+        )
+        char_budget = max_tokens * 2
+        used = 0
+        items = []
+        for raw in layered["flat"]:
+            title = str(raw.get("title") or "").strip()
+            content = str(raw.get("content") or "").strip()
+            remaining = max(0, char_budget - used)
+            if remaining <= 0:
+                break
+            clipped = content[:remaining]
+            item = {
+                "id": raw.get("id"),
+                "title": title,
+                "content": clipped,
+                "category": raw.get("category"),
+                "thread": raw.get("thread"),
+                "score": raw.get("score"),
+            }
+            items.append(item)
+            used += len(title) + len(clipped)
+        context = "\n\n".join(
+            f"【{item['title'] or item['category'] or '记忆'}】\n{item['content']}"
+            for item in items
+        )
+        return _private_json(
+            {
+                "query": query,
+                "items": items,
+                "context": context,
+                "sensitive_included": False,
+                "recorded_as_user_message": False,
+            }
+        )
+    except (TypeError, ValueError) as exc:
+        return _bridge_reject(400, str(exc))
+    except Exception:
+        log.exception("xinchao bridge recall failed")
+        return _bridge_reject(503, "memory recall is unavailable")
+
+
+async def xinchao_bridge_candidate(request: Request) -> JSONResponse:
+    if not settings.xinchao_bridge_token:
+        return _bridge_reject(503, "xinchao memory bridge is not configured")
+    if not _xinchao_bridge_authorized(request):
+        return _bridge_reject(401, "unauthorized")
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        relation_terms = payload.get("relation_terms") or []
+        if not isinstance(relation_terms, list):
+            raise ValueError("relation_terms must be an array")
+        result = await asyncio.to_thread(
+            store.propose_external_candidate,
+            title=str(payload.get("title") or "心潮梦境候选"),
+            content=str(payload.get("content") or ""),
+            external_id=str(payload.get("external_id") or ""),
+            category=str(payload.get("category") or "episode"),
+            thread=str(payload.get("thread") or "reflection"),
+            importance=float(payload.get("importance", 6.5)),
+            privacy_scope=str(payload.get("privacy_scope") or "personal"),
+            relation_terms=[str(item) for item in relation_terms],
+            proposer="xinchao",
+        )
+        return _private_json(result, status_code=202)
+    except (TypeError, ValueError) as exc:
+        return _bridge_reject(400, str(exc))
+    except Exception:
+        log.exception("xinchao candidate bridge failed")
+        return _bridge_reject(503, "candidate queue is unavailable")
+
+
 async def dashboard_stats(_: Request) -> JSONResponse:
     try:
         return _private_json(await asyncio.to_thread(store.dashboard_stats))
     except Exception:
         log.exception("dashboard stats failed")
         return _private_json({"error": "memory dashboard is unavailable"}, status_code=503)
+
+
+async def dashboard_mind(_: Request) -> JSONResponse:
+    return _private_json(await xinchao.snapshot())
 
 
 async def dashboard_memories(request: Request) -> JSONResponse:
@@ -788,7 +966,10 @@ mcp_http_app = mcp.streamable_http_app()
 routes = [
     Route("/", homepage, methods=["GET"]),
     Route("/healthz", health, methods=["GET"]),
+    Route("/bridge/xinchao/recall", xinchao_bridge_recall, methods=["POST"]),
+    Route("/bridge/xinchao/candidates", xinchao_bridge_candidate, methods=["POST"]),
     Route("/api/dashboard/stats", dashboard_stats, methods=["GET"]),
+    Route("/api/dashboard/mind", dashboard_mind, methods=["GET"]),
     Route("/api/dashboard/memories", dashboard_memories, methods=["GET"]),
     Route("/api/dashboard/candidates", dashboard_candidates, methods=["GET"]),
     Route(

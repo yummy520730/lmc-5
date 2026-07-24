@@ -69,6 +69,9 @@ class Settings:
     nap_interval_minutes: int
     nap_batch_size: int
     nap_relation_threshold: float
+    xinchao_base_url: str
+    xinchao_service_token: str
+    xinchao_bridge_token: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -118,6 +121,9 @@ class Settings:
             nap_relation_threshold=_bounded_float(
                 "LMC5_NAP_RELATION_THRESHOLD", 0.24, 0.10, 0.95
             ),
+            xinchao_base_url=os.getenv("LMC5_XINCHAO_URL", "").strip().rstrip("/"),
+            xinchao_service_token=os.getenv("LMC5_XINCHAO_TOKEN", "").strip(),
+            xinchao_bridge_token=os.getenv("LMC5_XINCHAO_BRIDGE_TOKEN", "").strip(),
         )
 
     def prepare_directories(self) -> None:
